@@ -566,7 +566,7 @@ def get_balance(s: UserSession):
     try:
         rpcs = [s.rpc_url, "https://polygon.drpc.org",
                 "https://polygon-bor-rpc.publicnode.com", "https://rpc.ankr.com/polygon"]
-        usdc    = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        usdc    = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
         call_d  = "0x70a08231000000000000000000000000" + s.wallet_address[2:]
         payload = {"jsonrpc":"2.0","method":"eth_call",
                    "params":[{"to":usdc,"data":call_d},"latest"],"id":1}
