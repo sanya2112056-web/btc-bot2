@@ -1395,7 +1395,7 @@ async def handle_callback(u, c):
         if s.auto_active:
             s.auto_active = False
             await q.message.reply_text("🔴 Авто вимкнено", reply_markup=main_keyboard(s))
-        else:
+            else:
         s.auto_active = True
         bal, _ = get_balance(s)
         bet = s.calc_bet_size(bal) if bal else 0.0
