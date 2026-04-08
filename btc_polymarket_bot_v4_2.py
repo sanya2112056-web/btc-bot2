@@ -5,32 +5,35 @@ from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
                            MessageHandler, ConversationHandler, filters)
 
 # ============================================================
-# CONFIG — Railway: env vars, локально: вставте значення
+# CONFIG
 # ============================================================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8570026592:AAGt2XI6TuFLvRVNZ6PS7Sgm93cA6HqVb9o")
-OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY",     "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")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "INSERT_TOKEN")
+OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY",     "INSERT_OPENAI_KEY")
+DEFAULT_RPC_URL    = os.getenv("ALCHEMY_RPC_URL",    "https://polygon-rpc.com")
+FALLBACK_RPC       = "https://polygon-rpc.com"
 
-# Глобальні дефолти (якщо користувач не підключив свій гаманець)
-DEFAULT_PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "")
-DEFAULT_RPC_URL     = os.getenv("ALCHEMY_RPC_URL", "https://polygon-rpc.com")
+# USDC на Polygon — правильний контракт
+USDC_CONTRACT      = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
+# Polymarket USDC spender (CTF Exchange)
+POLYMARKET_SPENDER = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+# approve.txt — щоб не повторювати approve
+APPROVED_FILE      = "approved.txt"
 
-AUTO_BET_SIZE     = float(os.getenv("AUTO_BET_SIZE",    "5.0"))
-AUTO_MIN_STRENGTH = os.getenv("AUTO_MIN_STRENGTH",       "MEDIUM")
-
-OI_CACHE_FILE = "oi_cache.json"
-SIGNALS_DUMP  = "signals_dump.json"
+AUTO_MIN_STRENGTH  = os.getenv("AUTO_MIN_STRENGTH", "MEDIUM")
+OI_CACHE_FILE      = "oi_cache.json"
+SIGNALS_DUMP       = "signals_dump.json"
+RISK_FILE          = "risk_settings.json"
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ============================================================
 # MULTI-USER STATE
-# кожен user_id має свою ізольовану сесію
 # ============================================================
 class UserSession:
     def __init__(self, uid):
         self.uid             = uid
-        self.private_key     = DEFAULT_PRIVATE_KEY
+        self.private_key     = os.getenv("POLYMARKET_PRIVATE_KEY", "")
         self.rpc_url         = DEFAULT_RPC_URL
         self.wallet_address  = None
         self.wallet_ok       = False
@@ -38,9 +41,43 @@ class UserSession:
         self.trade_history   = []
         self.auto_active     = False
         self.pending_trade   = {}
-        # файли прив'язані до user
-        self.history_file = "signal_history_%d.json" % uid
-        self.errors_file  = "errors_log_%d.json"     % uid
+        self.risk_percent    = self._load_risk()
+        self.history_file    = "signal_history_%d.json" % uid
+        self.errors_file     = "errors_log_%d.json"     % uid
+
+    def _load_risk(self):
+        """Завантажує % ризику з файлу або повертає дефолт 5%"""
+        try:
+            if os.path.exists(RISK_FILE):
+                with open(RISK_FILE) as f:
+                    data = json.load(f)
+                    pct = data.get(str(self.uid), 5.0)
+                    return float(pct)
+        except Exception:
+            pass
+        return 5.0
+
+    def save_risk(self):
+        """Зберігає % ризику у файл"""
+        try:
+            data = {}
+            if os.path.exists(RISK_FILE):
+                with open(RISK_FILE) as f:
+                    data = json.load(f)
+            data[str(self.uid)] = self.risk_percent
+            with open(RISK_FILE, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            logger.warning("Risk save: %s", e)
+
+    def calc_bet_size(self, balance: float) -> float:
+        """Розраховує суму ставки як % від балансу"""
+        if balance <= 0:
+            return 0.0
+        amount = balance * (self.risk_percent / 100.0)
+        amount = max(1.0, amount)                      # мінімум $1
+        amount = min(amount, balance * 0.20)           # максимум 20% балансу
+        return round(amount, 2)
 
 _sessions: dict = {}
 
@@ -64,7 +101,7 @@ def _save_history(s: UserSession):
         with open(s.history_file, "w") as f:
             json.dump(s.signal_history, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.warning("Hist save uid=%d: %s", s.uid, e)
+        logger.warning("Hist save: %s", e)
 
 def _save_error(s: UserSession, sig):
     try:
@@ -72,15 +109,16 @@ def _save_error(s: UserSession, sig):
         if os.path.exists(s.errors_file):
             with open(s.errors_file) as f:
                 errors = json.load(f)
-        errors.append(sig)
-        errors = errors[-300:]
+        errors.append(sig); errors = errors[-300:]
         with open(s.errors_file, "w") as f:
             json.dump(errors, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.warning("Err save uid=%d: %s", s.uid, e)
+        logger.warning("Err save: %s", e)
 
-# Conversation states для підключення гаманця
+# ConversationHandler states
 WALLET_KEY, WALLET_RPC = range(2)
+AUTO_PERCENT = 10
+SET_RISK_VAL = 11
 
 # ============================================================
 # HTTP
@@ -89,7 +127,7 @@ def safe_get(url, params=None, timeout=30):
     try:
         return requests.get(url, params=params, timeout=timeout).json()
     except Exception as e:
-        logger.warning("HTTP %s: %s", url, e)
+        logger.warning("HTTP GET %s: %s", url, e)
         return None
 
 def utc_now_str():
@@ -105,14 +143,12 @@ def fetch_candles(interval, limit):
     for _ in range(3):
         data = safe_get("https://fapi.binance.com/fapi/v1/klines",
                         {"symbol": "BTCUSDT", "interval": interval, "limit": limit})
-        if data and isinstance(data, list):
-            break
+        if data and isinstance(data, list): break
         time.sleep(2)
     if not data or not isinstance(data, list):
         data = safe_get("https://api.binance.com/api/v3/klines",
                         {"symbol": "BTCUSDT", "interval": interval, "limit": limit})
-    if not data or not isinstance(data, list):
-        return []
+    if not data or not isinstance(data, list): return []
     return [{"t":int(k[0]),"o":float(k[1]),"h":float(k[2]),
              "l":float(k[3]),"c":float(k[4]),"v":float(k[5])} for k in data]
 
@@ -120,66 +156,62 @@ def fetch_price():
     data = safe_get("https://fapi.binance.com/fapi/v1/ticker/price", {"symbol":"BTCUSDT"})
     if not data or not isinstance(data, dict):
         data = safe_get("https://api.binance.com/api/v3/ticker/price", {"symbol":"BTCUSDT"})
-    if data and isinstance(data, dict):
-        return float(data.get("price", 0))
+    if data and isinstance(data, dict): return float(data.get("price",0))
     return None
 
 def fetch_funding():
     data = safe_get("https://fapi.binance.com/fapi/v1/premiumIndex", {"symbol":"BTCUSDT"})
     if not data or not isinstance(data, dict):
         return {"rate":0.0,"sentiment":"NEUTRAL","mark":0.0,"basis":0.0}
-    fr   = float(data.get("lastFundingRate", 0))
-    mark = float(data.get("markPrice", 0))
-    idx  = float(data.get("indexPrice", mark))
-    sent = "LONGS_TRAPPED" if fr>0.0005 else "SHORTS_TRAPPED" if fr<-0.0003 else "NEUTRAL"
+    fr=float(data.get("lastFundingRate",0)); mark=float(data.get("markPrice",0))
+    idx=float(data.get("indexPrice",mark))
+    sent="LONGS_TRAPPED" if fr>0.0005 else "SHORTS_TRAPPED" if fr<-0.0003 else "NEUTRAL"
     return {"rate":fr,"sentiment":sent,"mark":mark,"basis":round(mark-idx,2)}
 
 def fetch_liquidations():
-    now_ms = int(time.time()*1000); cutoff = now_ms-900000
-    data = safe_get("https://fapi.binance.com/fapi/v1/forceOrders",{"symbol":"BTCUSDT","limit":200})
+    now_ms=int(time.time()*1000); cutoff=now_ms-900000
+    data=safe_get("https://fapi.binance.com/fapi/v1/forceOrders",{"symbol":"BTCUSDT","limit":200})
     if not data or isinstance(data,dict):
-        data = safe_get("https://fapi.binance.com/fapi/v1/allForceOrders",{"symbol":"BTCUSDT","limit":200})
-    if not data or not isinstance(data, list):
+        data=safe_get("https://fapi.binance.com/fapi/v1/allForceOrders",{"symbol":"BTCUSDT","limit":200})
+    if not data or not isinstance(data,list):
         return {"liq_longs":0.0,"liq_shorts":0.0,"signal":"NEUTRAL","exhaustion":False,"total_usd":0.0}
-    recent    = [x for x in data if isinstance(x,dict) and int(x.get("time",0))>=cutoff] or data[:50]
-    liq_longs = sum(float(x.get("origQty",0))*float(x.get("price",0)) for x in recent if x.get("side")=="SELL")
-    liq_shorts= sum(float(x.get("origQty",0))*float(x.get("price",0)) for x in recent if x.get("side")=="BUY")
-    total = liq_longs+liq_shorts
-    signal= "SHORT_SQUEEZE_FUEL" if liq_shorts>liq_longs*2 else "LONG_CASCADE_FUEL" if liq_longs>liq_shorts*2 else "NEUTRAL"
-    return {"liq_longs":round(liq_longs,2),"liq_shorts":round(liq_shorts,2),
-            "signal":signal,"exhaustion":total>5_000_000,"total_usd":round(total,2)}
+    recent=[x for x in data if isinstance(x,dict) and int(x.get("time",0))>=cutoff] or data[:50]
+    ll=sum(float(x.get("origQty",0))*float(x.get("price",0)) for x in recent if x.get("side")=="SELL")
+    ls=sum(float(x.get("origQty",0))*float(x.get("price",0)) for x in recent if x.get("side")=="BUY")
+    total=ll+ls
+    sig="SHORT_SQUEEZE_FUEL" if ls>ll*2 else "LONG_CASCADE_FUEL" if ll>ls*2 else "NEUTRAL"
+    return {"liq_longs":round(ll,2),"liq_shorts":round(ls,2),"signal":sig,
+            "exhaustion":total>5_000_000,"total_usd":round(total,2)}
 
 def fetch_oi():
-    data = safe_get("https://fapi.binance.com/fapi/v1/openInterest",{"symbol":"BTCUSDT"})
-    if not data or not isinstance(data, dict): return 0.0, 0.0
-    cur = float(data.get("openInterest",0))
+    data=safe_get("https://fapi.binance.com/fapi/v1/openInterest",{"symbol":"BTCUSDT"})
+    if not data or not isinstance(data,dict): return 0.0,0.0
+    cur=float(data.get("openInterest",0))
     try:
-        prev = cur
+        prev=cur
         if os.path.exists(OI_CACHE_FILE):
             with open(OI_CACHE_FILE) as f: prev=json.load(f).get("oi",cur)
         with open(OI_CACHE_FILE,"w") as f: json.dump({"oi":cur,"ts":ts_unix()},f)
-        return cur, round((cur-prev)/prev*100,4) if prev>0 else 0.0
-    except Exception: return cur, 0.0
+        return cur,round((cur-prev)/prev*100,4) if prev>0 else 0.0
+    except Exception: return cur,0.0
 
 def fetch_orderbook():
     try:
-        data = safe_get("https://fapi.binance.com/fapi/v1/depth",{"symbol":"BTCUSDT","limit":20})
+        data=safe_get("https://fapi.binance.com/fapi/v1/depth",{"symbol":"BTCUSDT","limit":20})
         if not data or not isinstance(data,dict): return {"imbalance":0.0,"bias":"NEUTRAL"}
-        bids  = sum(float(b[1]) for b in data.get("bids",[])[:10])
-        asks  = sum(float(a[1]) for a in data.get("asks",[])[:10])
-        total = bids+asks
-        imb   = round((bids-asks)/total*100,2) if total>0 else 0.0
+        bids=sum(float(b[1]) for b in data.get("bids",[])[:10])
+        asks=sum(float(a[1]) for a in data.get("asks",[])[:10])
+        total=bids+asks; imb=round((bids-asks)/total*100,2) if total>0 else 0.0
         return {"imbalance":imb,"bias":"BID_HEAVY" if imb>20 else "ASK_HEAVY" if imb<-20 else "BALANCED"}
     except Exception: return {"imbalance":0.0,"bias":"NEUTRAL"}
 
 def fetch_lsr():
     try:
-        data = safe_get("https://fapi.binance.com/futures/data/topLongShortPositionRatio",
-                        {"symbol":"BTCUSDT","period":"15m","limit":3})
+        data=safe_get("https://fapi.binance.com/futures/data/topLongShortPositionRatio",
+                      {"symbol":"BTCUSDT","period":"15m","limit":3})
         if not data or not isinstance(data,list): return {"ratio":1.0,"long_pct":50.0,"bias":"NEUTRAL"}
-        latest   = data[-1]
-        ratio    = float(latest.get("longShortRatio",1.0))
-        long_pct = float(latest.get("longAccount",0.5))*100
+        latest=data[-1]; ratio=float(latest.get("longShortRatio",1.0))
+        long_pct=float(latest.get("longAccount",0.5))*100
         return {"ratio":round(ratio,3),"long_pct":round(long_pct,1),
                 "bias":"CROWD_LONG" if ratio>1.5 else "CROWD_SHORT" if ratio<0.7 else "NEUTRAL"}
     except Exception: return {"ratio":1.0,"long_pct":50.0,"bias":"NEUTRAL"}
@@ -247,7 +279,7 @@ def find_fvg(candles,price):
     for i in range(1,len(candles)-1):
         pv,nx=candles[i-1],candles[i+1]
         if nx["l"]>pv["h"]:
-            mid=( nx["l"]+pv["h"])/2; dist=round((price-mid)/price*100,4)
+            mid=(nx["l"]+pv["h"])/2; dist=round((price-mid)/price*100,4)
             if mid<price and (fb is None or dist<fb["dist"]): fb={"top":nx["l"],"bot":pv["h"],"dist":dist,"size":round(nx["l"]-pv["h"],2)}
         if nx["h"]<pv["l"]:
             mid=(pv["l"]+nx["h"])/2; dist=round((mid-price)/price*100,4)
@@ -402,121 +434,269 @@ def get_full_payload(s: UserSession):
     }
 
 # ============================================================
+# БАЛАНС USDC — правильний контракт 0x3c499c...
+# ============================================================
+def get_balance(s: UserSession):
+    if not s.wallet_ok or not s.wallet_address:
+        return None, "Гаманець не підключено"
+    try:
+        # ERC-20 balanceOf(address) ABI call
+        call_data = "0x70a08231000000000000000000000000" + s.wallet_address[2:].lower()
+        payload   = {"jsonrpc":"2.0","method":"eth_call",
+                     "params":[{"to": USDC_CONTRACT, "data": call_data}, "latest"],"id":1}
+        rpcs = [s.rpc_url, FALLBACK_RPC,
+                "https://polygon.drpc.org",
+                "https://polygon-bor-rpc.publicnode.com",
+                "https://rpc.ankr.com/polygon"]
+        for rpc in rpcs:
+            if not rpc: continue
+            try:
+                r = requests.post(rpc, json=payload, timeout=10)
+                d = r.json()
+                result = d.get("result","")
+                if result and result not in ("0x","0x0","","0x0000000000000000000000000000000000000000000000000000000000000000"):
+                    raw = int(result, 16)
+                    # USDC має 6 decimals
+                    return round(raw / 1e6, 2), s.wallet_address
+            except Exception as e:
+                logger.warning("RPC %s balance error: %s", rpc, e)
+                continue
+        return 0.0, s.wallet_address   # гаманець підключено але баланс 0
+    except Exception as e:
+        return None, str(e)
+
+# ============================================================
+# AUTO-APPROVE USDC — один раз при старті
+# ============================================================
+def approve_usdc(s: UserSession) -> tuple:
+    """
+    Апрувить USDC для Polymarket spender.
+    Виконується 1 раз — перевіряє approved.txt
+    Повертає (success: bool, message: str)
+    """
+    approved_key = "%s_%d" % (s.wallet_address, s.uid) if s.wallet_address else str(s.uid)
+    # Перевіряємо чи вже апрувлено
+    if os.path.exists(APPROVED_FILE):
+        with open(APPROVED_FILE) as f:
+            approved_list = f.read().splitlines()
+        if approved_key in approved_list:
+            logger.info("USDC already approved for %s", s.wallet_address)
+            return True, "Already approved"
+
+    try:
+        from web3 import Web3
+        from eth_account import Account
+
+        rpc = s.rpc_url or FALLBACK_RPC
+        w3  = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 30}))
+        if not w3.is_connected():
+            w3 = Web3(Web3.HTTPProvider(FALLBACK_RPC, request_kwargs={"timeout": 30}))
+
+        key = s.private_key.strip().replace(" ","").replace("\n","").replace("\r","")
+        if key.lower().startswith("0x"): key = key[2:]
+        account = Account.from_key(key)
+
+        # ERC-20 approve ABI: approve(address spender, uint256 amount)
+        approve_abi = [{
+            "name": "approve", "type": "function", "stateMutability": "nonpayable",
+            "inputs": [{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],
+            "outputs": [{"name":"","type":"bool"}]
+        }]
+        usdc = w3.eth.contract(
+            address=Web3.to_checksum_address(USDC_CONTRACT),
+            abi=approve_abi
+        )
+        spender    = Web3.to_checksum_address(POLYMARKET_SPENDER)
+        allowance  = int(1e12 * 1e6)   # 1 трлн USDC (з 6 decimals) — максимальний approve
+        nonce      = w3.eth.get_transaction_count(account.address)
+        gas_price  = w3.eth.gas_price
+
+        tx = usdc.functions.approve(spender, allowance).build_transaction({
+            "chainId": 137,
+            "from":    account.address,
+            "nonce":   nonce,
+            "gas":     100000,
+            "gasPrice": gas_price,
+        })
+        signed = account.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+        if receipt.status == 1:
+            logger.info("USDC approved. TxHash: %s", tx_hash.hex())
+            # Зберігаємо в approved.txt
+            with open(APPROVED_FILE, "a") as f:
+                f.write(approved_key + "\n")
+            return True, "Approved. Tx: 0x%s" % tx_hash.hex()
+        else:
+            return False, "Approve TX failed (status=0)"
+
+    except ImportError:
+        return False, "pip install web3"
+    except Exception as e:
+        err = str(e)
+        logger.error("Approve error: %s", err)
+        if "insufficient funds" in err.lower():
+            return False, "Недостатньо MATIC для газу"
+        return False, "Approve помилка: %s" % err[:200]
+
+# ============================================================
 # POLYMARKET — динамічний пошук маркету BTC 15m
 # ============================================================
 _market_cache = {"id": None, "name": None, "token_yes": None, "token_no": None, "expires": 0}
 
 def _find_btc15m_market():
     """
-    Шукає ПОТОЧНИЙ активний маркет 'BTC Up or Down 15 minutes'.
-    Кешує ID до кінця раунду. Повертає dict з id, name, token_yes, token_no.
+    Шукає активний BTC 15m маркет через gamma-api.
+    Фільтрує: active=true, рівно 2 токени (YES/NO).
+    НЕ шукає по назві — бере перший підходящий активний маркет.
+    Кешує до кінця раунду.
     """
     now = time.time()
     if _market_cache["id"] and now < _market_cache["expires"]:
         return _market_cache
 
-    queries = [
-        "BTC Up or Down 15 minutes",
-        "Bitcoin Up or Down 15",
-        "BTC 15 min",
-        "Bitcoin 15 minutes",
-    ]
-    endpoints = [
-        "https://gamma-api.polymarket.com/markets",
-        "https://clob.polymarket.com/markets",
+    logger.info("Searching for active BTC 15m market...")
+
+    # Пробуємо різні підходи до пошуку
+    search_params_list = [
+        {"active": "true", "limit": 100, "order": "end_date_asc"},
+        {"active": "true", "limit": 100},
+        {"active": "true", "limit": 200, "tag": "crypto"},
     ]
 
     best = None
-    for ep in endpoints:
-        for q in queries:
-            for attempt in range(3):
-                try:
-                    resp = requests.get(ep, params={"q": q, "active": "true", "limit": 50}, timeout=15)
-                    markets = resp.json()
-                    if not isinstance(markets, list):
-                        markets = markets.get("markets", []) if isinstance(markets, dict) else []
-                    for m in markets:
-                        title = m.get("question","") or m.get("title","")
-                        tl = title.lower()
-                        if m.get("closed", True):
-                            continue
-                        if not (("btc" in tl or "bitcoin" in tl) and "15" in tl):
-                            continue
-                        # беремо маркет що завершується найближче в майбутньому
-                        end_ts = 0
-                        for tf in ("endDate","end_date_iso","endDateIso","end_time","endTime"):
-                            v = m.get(tf)
-                            if v:
-                                try:
-                                    end_ts = int(datetime.datetime.fromisoformat(
-                                        str(v).replace("Z","+00:00")).timestamp())
-                                except Exception:
-                                    try: end_ts = int(v)
-                                    except Exception: pass
-                                break
-                        if end_ts and end_ts < now:
-                            continue  # вже завершений
-                        mid = m.get("conditionId") or m.get("id") or m.get("condition_id")
-                        if not mid:
-                            continue
-                        if best is None or (end_ts and end_ts < best.get("end_ts", 999999999)):
-                            best = {"id": mid, "name": title, "end_ts": end_ts, "raw": m}
-                    if best:
-                        break
-                except Exception as e:
-                    logger.warning("Market search attempt %d: %s", attempt+1, e)
-                    time.sleep(2)
-            if best:
-                break
+    for params in search_params_list:
+        for attempt in range(3):
+            try:
+                resp = requests.get(
+                    "https://gamma-api.polymarket.com/markets",
+                    params=params, timeout=20)
+                if resp.status_code != 200:
+                    time.sleep(2); continue
+                markets = resp.json()
+                if isinstance(markets, dict):
+                    markets = markets.get("markets", markets.get("data", []))
+                if not isinstance(markets, list):
+                    break
+
+                for m in markets:
+                    # Фільтр 1: має бути активним
+                    if m.get("closed", True) or not m.get("active", False):
+                        continue
+
+                    # Фільтр 2: рівно 2 токени
+                    tokens = m.get("tokens", m.get("outcomes", []))
+                    if len(tokens) != 2:
+                        continue
+
+                    # Фільтр 3: BTC + 15 хвилин в назві (після активного фільтру)
+                    title = (m.get("question","") or m.get("title","")).lower()
+                    if not (("btc" in title or "bitcoin" in title) and "15" in title):
+                        continue
+
+                    # Фільтр 4: end_time в майбутньому
+                    end_ts = 0
+                    for tf in ("endDate","end_date_iso","endDateIso","end_time","endTime","enddate"):
+                        v = m.get(tf)
+                        if v:
+                            try:
+                                end_ts = int(datetime.datetime.fromisoformat(
+                                    str(v).replace("Z","+00:00")).timestamp())
+                            except Exception:
+                                try: end_ts = int(v)
+                                except Exception: pass
+                            if end_ts: break
+
+                    if end_ts and end_ts < now:
+                        continue  # вже завершений
+
+                    mid = m.get("conditionId") or m.get("condition_id") or m.get("id")
+                    if not mid:
+                        continue
+
+                    # Беремо найближчий до завершення
+                    if best is None or (end_ts and end_ts < best.get("end_ts", 9999999999)):
+                        # Визначаємо токени YES/NO
+                        token_yes = token_no = None
+                        for t in tokens:
+                            oc = (t.get("outcome") or t.get("name") or "").upper()
+                            if oc in ("YES","UP","HIGHER"):   token_yes = t
+                            if oc in ("NO","DOWN","LOWER"):   token_no  = t
+                        # Якщо не вдалось за назвою — беремо перший/другий
+                        if not token_yes and len(tokens) >= 1: token_yes = tokens[0]
+                        if not token_no  and len(tokens) >= 2: token_no  = tokens[1]
+
+                        best = {
+                            "id": str(mid),
+                            "name": m.get("question","") or m.get("title","BTC 15m"),
+                            "end_ts": end_ts,
+                            "token_yes": token_yes,
+                            "token_no": token_no,
+                        }
+
+                if best:
+                    break
+            except Exception as e:
+                logger.warning("Market search attempt %d: %s", attempt+1, e)
+                time.sleep(2)
         if best:
             break
 
     if not best:
-        logger.error("BTC 15m market not found")
+        logger.error("BTC 15m market not found after all attempts")
         return None
 
-    # Витягуємо token_id для YES і NO через CLOB
-    token_yes = token_no = None
-    try:
-        clob_resp = requests.get(
-            "https://clob.polymarket.com/markets/%s" % best["id"], timeout=15)
-        mdata = clob_resp.json()
-        tokens = mdata.get("tokens", [])
-        for t in tokens:
-            oc = t.get("outcome","").upper()
-            if oc in ("YES","UP"):   token_yes = t
-            if oc in ("NO","DOWN"):  token_no  = t
-        # fallback — пробуємо raw
-        if not tokens:
-            raw = best.get("raw",{})
-            tokens = raw.get("tokens", raw.get("outcomes", []))
-            for t in tokens:
-                oc = (t.get("outcome") or t.get("name","")).upper()
-                if oc in ("YES","UP"):   token_yes = t
-                if oc in ("NO","DOWN"):  token_no  = t
-    except Exception as e:
-        logger.warning("Token fetch: %s", e)
+    # Якщо token_id не в tokens — пробуємо CLOB
+    if best["token_yes"] and not best["token_yes"].get("token_id"):
+        try:
+            clob = requests.get(
+                "https://clob.polymarket.com/markets/%s" % best["id"],
+                timeout=15)
+            if clob.status_code == 200:
+                cdata  = clob.json()
+                ctokens = cdata.get("tokens",[])
+                if len(ctokens) == 2:
+                    for t in ctokens:
+                        oc = t.get("outcome","").upper()
+                        if oc in ("YES","UP"):   best["token_yes"] = t
+                        if oc in ("NO","DOWN"):  best["token_no"]  = t
+        except Exception as e:
+            logger.warning("CLOB token fetch: %s", e)
 
-    # Кешуємо до кінця раунду (або 14 хв якщо end_ts невідомий)
-    expires = best["end_ts"] - 30 if best.get("end_ts") else now + 840
-    _market_cache.update({"id": best["id"], "name": best["name"],
-                           "token_yes": token_yes, "token_no": token_no,
-                           "expires": expires})
-    logger.info("Market found: %s [%s]", best["name"], best["id"])
+    # Кешуємо до кінця раунду (або 14 хв)
+    expires = (best["end_ts"] - 30) if best.get("end_ts") else (now + 840)
+    _market_cache.update({
+        "id":        best["id"],
+        "name":      best["name"],
+        "token_yes": best["token_yes"],
+        "token_no":  best["token_no"],
+        "expires":   expires,
+    })
+    logger.info("Market found: %s [%s] expires in %.0f sec",
+                best["name"], best["id"], expires - now)
     return _market_cache
 
-def place_bet(s: UserSession, direction: str, amount: float):
+# ============================================================
+# PLACE BET — GTC order, % від балансу
+# ============================================================
+def place_bet(s: UserSession, direction: str, amount: float) -> dict:
     """
     direction = "UP" або "DOWN"
-    Повертає {"success": bool, "error": str, "price": float, "pot": float}
+    amount    = сума в USDC (вже розрахована з % балансу)
+    Повертає {"success": bool, "error": str, "price": float, "pot": float, "market_name": str}
     """
     if not s.wallet_ok or not s.private_key:
         return {"success": False, "error": "Гаманець не підключено. Натисни 🔗 Підключити гаманець"}
+    if amount < 1.0:
+        return {"success": False, "error": "Мінімальна ставка $1. Поповніть баланс."}
 
+    # Шукаємо маркет (retry 2 рази)
     market = _find_btc15m_market()
     if not market:
-        # retry раз
         time.sleep(3)
+        # скидаємо кеш і пробуємо ще раз
+        _market_cache["id"] = None
         market = _find_btc15m_market()
     if not market:
         return {"success": False, "error": "Маркет BTC 15m не знайдено. Спробуй пізніше."}
@@ -532,111 +712,104 @@ def place_bet(s: UserSession, direction: str, amount: float):
         key = (s.private_key.strip()
                .replace(" ","").replace("\n","").replace("\r","")
                .replace('"',"").replace("'",""))
-        if key.lower().startswith("0x"):
-            key = key[2:]
+        if key.lower().startswith("0x"): key = key[2:]
 
         client = ClobClient(host="https://clob.polymarket.com", key=key, chain_id=137)
         price  = float(token.get("price", 0.5))
-        pot    = round(amount / price - amount, 2) if price > 0 else 0.0
+        if price <= 0 or price >= 1:
+            price = 0.5  # fallback
+        pot = round(amount / price - amount, 2) if price > 0 else 0.0
 
+        token_id = token.get("token_id") or token.get("id") or token.get("tokenId", "")
+        if not token_id:
+            return {"success": False, "error": "token_id не знайдено"}
+
+        # GTC замість FOK — order залишається в книзі
         order = client.create_and_post_order(OrderArgs(
-            token_id=token.get("token_id") or token.get("id",""),
-            price=price, size=amount, side="BUY", order_type=OrderType.FOK))
-        return {"success": True, "order": order, "price": price,
-                "pot": pot, "market_name": market["name"]}
+            token_id=token_id,
+            price=price,
+            size=amount,
+            side="BUY",
+            order_type=OrderType.GTC   # ← ВИПРАВЛЕНО: GTC замість FOK
+        ))
+
+        logger.info("Order placed: uid=%d dir=%s amount=%.2f price=%.4f token=%s",
+                    s.uid, direction, amount, price, token_id[:20])
+        return {
+            "success":     True,
+            "order":       order,
+            "price":       price,
+            "pot":         pot,
+            "market_name": market["name"],
+            "token_id":    token_id,
+        }
+
     except ImportError:
         return {"success": False, "error": "pip install py-clob-client"}
     except Exception as e:
         err = str(e)
-        # детальне повідомлення про помилку
-        if "insufficient" in err.lower():
-            return {"success": False, "error": "Недостатньо USDC балансу"}
-        if "allowance" in err.lower():
-            return {"success": False, "error": "Потрібно approve USDC на Polymarket"}
+        logger.error("Order error uid=%d: %s", s.uid, err)
+        # Детальні повідомлення
+        if "insufficient" in err.lower() or "balance" in err.lower():
+            return {"success": False, "error": "Недостатньо USDC балансу ($%.2f потрібно)" % amount}
+        if "allowance" in err.lower() or "approve" in err.lower():
+            return {"success": False, "error": "Потрібно approve USDC. Запусти /approve"}
         if "nonce" in err.lower():
-            return {"success": False, "error": "Помилка nonce транзакції, спробуй ще"}
+            return {"success": False, "error": "Помилка nonce. Спробуй ще раз."}
+        if "not found" in err.lower() or "market" in err.lower():
+            _market_cache["id"] = None  # скидаємо кеш маркету
+            return {"success": False, "error": "Маркет застарів, спробуй ще раз"}
         return {"success": False, "error": err[:200]}
 
 # ============================================================
-# БАЛАНС USDC (Polygon)
-# ============================================================
-def get_balance(s: UserSession):
-    if not s.wallet_ok or not s.wallet_address:
-        return None, "Гаманець не підключено"
-    try:
-        rpcs = [s.rpc_url, "https://polygon.drpc.org",
-                "https://polygon-bor-rpc.publicnode.com", "https://rpc.ankr.com/polygon"]
-        usdc    = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
-        call_d  = "0x70a08231000000000000000000000000" + s.wallet_address[2:]
-        payload = {"jsonrpc":"2.0","method":"eth_call",
-                   "params":[{"to":usdc,"data":call_d},"latest"],"id":1}
-        for rpc in rpcs:
-            if not rpc or "INSERT" in rpc:
-                continue
-            try:
-                r = requests.post(rpc, json=payload, timeout=10)
-                d = r.json()
-                if d and "result" in d and d["result"] not in ("0x","0x0",None,""):
-                    return round(int(d["result"],16)/1e6, 2), s.wallet_address
-            except Exception:
-                continue
-        return None, "Всі RPC недоступні"
-    except Exception as e:
-        return None, str(e)
-
-# ============================================================
-# ПІДКЛЮЧЕННЯ ГАМАНЦЯ — валідація
+# ПІДКЛЮЧЕННЯ ГАМАНЦЯ
 # ============================================================
 def validate_and_connect_wallet(s: UserSession, private_key: str, rpc_url: str):
-    """
-    Перевіряє приватний ключ, підключається до Polygon, повертає (ok, message)
-    """
     try:
         from eth_account import Account
         key = (private_key.strip()
                .replace(" ","").replace("\n","").replace("\r","")
                .replace('"',"").replace("'",""))
-        if key.lower().startswith("0x"):
-            key = key[2:]
+        if key.lower().startswith("0x"): key = key[2:]
         if len(key) != 64:
-            return False, "Ключ має бути 64 символи (hex). Зараз: %d символів.\nПереконайся що скопіював правильно без 0x префіксу." % len(key)
+            return False, "Ключ має бути 64 символи hex. Зараз: %d символів." % len(key)
         try:
             int(key, 16)
         except ValueError:
-            return False, "Ключ містить неприпустимі символи. Має бути тільки 0-9 і a-f."
+            return False, "Ключ містить неприпустимі символи (тільки 0-9, a-f)."
 
         account = Account.from_key(key)
         addr    = account.address
 
-        # Перевіряємо підключення до мережі
-        rpcs_to_try = [rpc_url, "https://polygon.drpc.org", "https://polygon-bor-rpc.publicnode.com"]
+        # Перевіряємо підключення до Polygon
+        rpcs = [rpc_url, FALLBACK_RPC]
         connected = False
-        for rpc in rpcs_to_try:
+        working_rpc = rpc_url
+        for rpc in rpcs:
             try:
                 r = requests.post(rpc, json={"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}, timeout=8)
                 d = r.json()
-                if d.get("result") in ("0x89", "137"):  # Polygon mainnet
-                    connected = True
-                    break
-                elif d.get("result"):
-                    connected = True
-                    break
-            except Exception:
-                continue
+                chain = d.get("result","")
+                # Polygon = 0x89 = 137
+                if chain in ("0x89","137") or (isinstance(chain,str) and int(chain,16)==137):
+                    connected=True; working_rpc=rpc; break
+                elif chain:  # будь-яка відповідь = підключення є
+                    connected=True; working_rpc=rpc; break
+            except Exception: continue
 
         if not connected:
-            return False, "Не вдалося підключитись до Polygon RPC.\nСпробуй: https://polygon-rpc.com"
+            return False, "Не вдалося підключитись до Polygon.\nСпробуй: https://polygon-rpc.com"
 
         s.private_key    = key
-        s.rpc_url        = rpc_url
+        s.rpc_url        = working_rpc
         s.wallet_address = addr
         s.wallet_ok      = True
         return True, addr
 
     except ImportError:
-        return False, "Бібліотека eth-account не встановлена на сервері"
+        return False, "eth-account не встановлено на сервері"
     except Exception as e:
-        return False, "Помилка підключення: %s" % str(e)
+        return False, "Помилка: %s" % str(e)
 
 # ============================================================
 # NEWS
@@ -657,45 +830,30 @@ def get_news():
     return "Новини недоступні"
 
 # ============================================================
-# AI SYSTEM PROMPT — без змін (v4.1 логіка)
+# AI PROMPT (v4.1 логіка — без змін)
 # ============================================================
 SYSTEM_PROMPT = """You are an elite BTC short-term trader. Task: predict if BTC will be HIGHER (UP) or LOWER (DOWN) than current price in exactly 15 minutes on Polymarket.
 
-IMPORTANT: You analyze from scratch every time. Do NOT mechanically repeat or avoid previous signals — only the current data matters. The last signal context is shown only so you are aware of it, not to copy or invert it.
+IMPORTANT: Analyze from scratch every time. Last signal = awareness only, do NOT copy or invert.
 
-============================
-TIMEFRAME LOGIC
-============================
-15m = context | 5m = tactics | 1m = execution
+TIMEFRAMES: 15m=context | 5m=tactics | 1m=execution
 
-============================
-AMD FRAMEWORK — FIXED LOGIC
-============================
-Accumulation = price ranges quietly, avg_body < 0.10%, range < 0.6%
-Manipulation = liquidity sweep
+AMD FRAMEWORK:
 SWEEP LOW → smart money BOUGHT → UP (+3)
-SWEEP HIGH + close BELOW sweep level → reversal DOWN (+3)
+SWEEP HIGH + close BELOW level → reversal DOWN (+3)
 SWEEP HIGH + HOLDS ABOVE → bull continuation UP (+1, NOT DOWN)
-Check AMD.reason field always.
 
-============================
-RANGING MARKET RULES
-============================
-dist_below < 0.1% = bounce UP | dist_above < 0.1% = rejection DOWN
-dist_above < 0.05% + sweep HIGH + close below = STRONG DOWN (-3)
-dist_below < dist_above AND < 0.3% = lean UP
-dist_above < dist_below AND < 0.3% = lean DOWN
-both > 0.5% = use momentum + orderbook
-CHOP_ZONE = reduce to LOW
+RANGING RULES:
+dist_below<0.1% = bounce UP | dist_above<0.1% = rejection DOWN
+dist_below<dist_above AND <0.3% = lean UP | dist_above<dist_below AND <0.3% = lean DOWN
+both >0.5% = use momentum + orderbook | CHOP_ZONE = reduce to LOW
 
-============================
-SCORING
-============================
-+3 AMD MANIPULATION_DONE UP | -3 AMD MANIPULATION_DONE DOWN
+SCORING:
++3 AMD MANIPULATION_DONE UP | -3 DOWN
 +2 dist_below<0.1% | CHoCH UP 5m | BOS UP 5m | SHORT_SQUEEZE | SWEEP_TRAP_LOW
--2 dist_above<0.1% | CHoCH DOWN 5m | BOS DOWN 5m | LONG_CASCADE | SWEEP_TRAP_HIGH
-+1 FVG5m_below<0.15% | FVG1m_below<0.10% | dist_below<dist_above<0.3% | BID_HEAVY | CROWD_SHORT+SHORTS_TRAPPED | micro_mom>0.03% | OI_rising+price_up | LONDON | struct5m_BULLISH
--1 mirror for DOWN | CHOP_ZONE | DEAD_HOURS | exhaustion
+-2 dist_above<0.1% | CHoCH DOWN | BOS DOWN | LONG_CASCADE | SWEEP_TRAP_HIGH
++1/-1 FVG | BID/ASK_HEAVY | CROWD_SHORT/LONG | micro_mom | OI | session | struct5m
+PENALTIES: -1 CHOP_ZONE | DEAD_HOURS | exhaustion
 
 STRENGTH: >=5=HIGH | 3-4=MEDIUM | 1-2=LOW | 0=micro_mom LOW
 ALWAYS UP or DOWN.
@@ -747,8 +905,7 @@ def analyze_with_ai(payload, s: UserSession):
              temperature=0.1,response_format={"type":"json_object"})
         return json.loads(resp.choices[0].message.content)
     except Exception as e:
-        logger.error("AI uid=%d: %s",s.uid,e)
-        return None
+        logger.error("AI uid=%d: %s",s.uid,e); return None
 
 # ============================================================
 # SIGNALS DUMP
@@ -790,6 +947,7 @@ def save_signal_dump(payload, result, s: UserSession):
             "exhaustion":pos["exhaustion"],"oi":pos["oi"],"oi_change":pos["oi_change"],
             "ob_bias":pos["ob_bias"],"ob_imbalance":pos["ob_imbalance"],
             "lsr_bias":pos["lsr_bias"],"lsr_ratio":pos["lsr_ratio"],"crowd_long":pos["crowd_long"],
+            "risk_percent":s.risk_percent,
         }
         dump.append(record); dump=dump[-2000:]
         with open(SIGNALS_DUMP,"w") as f: json.dump(dump,f,ensure_ascii=False,indent=2)
@@ -809,44 +967,19 @@ def update_dump_outcome(ts_unix_val, uid, outcome, exit_price, real_move):
 # CSV ЛОГ
 # ============================================================
 def build_csv(s: UserSession) -> bytes:
-    """Будує CSV з усіх сигналів користувача"""
     fields = ["ts","decision","strength","confidence_score","outcome","entry_price",
               "exit_price","real_move","key_signal","session","market_condition",
               "amd_phase","amd_direction","amd_reason","sweep15m_type","sweep15m_level",
               "dist_above","dist_below","trap_type","oi_change","funding_rate","funding_sent",
-              "ob_bias","lsr_bias","liq_signal","logic"]
+              "ob_bias","lsr_bias","liq_signal","risk_percent","logic"]
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
     writer.writeheader()
     for sig in s.signal_history:
-        row = {
-            "ts":               sig.get("time",""),
-            "decision":         sig.get("decision",""),
-            "strength":         sig.get("strength",""),
-            "confidence_score": sig.get("confidence_score",""),
-            "outcome":          sig.get("outcome","PENDING"),
-            "entry_price":      sig.get("entry_price",""),
-            "exit_price":       sig.get("exit_price",""),
-            "real_move":        sig.get("real_move",""),
-            "key_signal":       sig.get("key_signal",""),
-            "session":          sig.get("session",""),
-            "market_condition": sig.get("mkt_cond",""),
-            "amd_phase":        sig.get("amd_phase",""),
-            "amd_direction":    sig.get("amd_direction",""),
-            "amd_reason":       sig.get("amd_reason",""),
-            "sweep15m_type":    sig.get("sweep_type",""),
-            "sweep15m_level":   sig.get("sweep_level",""),
-            "dist_above":       sig.get("dist_above",""),
-            "dist_below":       sig.get("dist_below",""),
-            "trap_type":        sig.get("trap_type",""),
-            "oi_change":        sig.get("oi_change",""),
-            "funding_rate":     sig.get("funding_rate",""),
-            "funding_sent":     sig.get("funding_sent",""),
-            "ob_bias":          sig.get("ob_bias",""),
-            "lsr_bias":         sig.get("lsr_bias",""),
-            "liq_signal":       sig.get("liq_signal",""),
-            "logic":            sig.get("logic",""),
-        }
+        row = {k: sig.get(k, "") for k in fields}
+        row["ts"]       = sig.get("time","")
+        row["entry_price"] = sig.get("entry_price","")
+        row["risk_percent"] = s.risk_percent
         writer.writerow(row)
     return buf.getvalue().encode("utf-8")
 
@@ -892,11 +1025,12 @@ def get_stats_text(s: UserSession):
         if sub:
             w=len([sg for sg in sub if sg["outcome"]=="WIN"])
             lines.append("%s: %d/%d (%.1f%%)"%(sess,w,len(sub),round(w/len(sub)*100,1)))
-    lines.append("\n/errors — деталі помилок")
+    lines.append("\nРизик: %.0f%% від балансу за угоду" % s.risk_percent)
+    lines.append("/errors — деталі помилок")
     return "\n".join(lines)
 
 # ============================================================
-# TELEGRAM KEYBOARDS
+# KEYBOARDS
 # ============================================================
 def main_keyboard(s: UserSession):
     wallet_btn = "✅ Гаманець підключено" if s.wallet_ok else "🔗 Підключити гаманець"
@@ -909,32 +1043,34 @@ def main_keyboard(s: UserSession):
         [InlineKeyboardButton(auto_btn, callback_data="toggle_auto"),
          InlineKeyboardButton("📡 Аналіз зараз", callback_data="analyze_now")],
         [InlineKeyboardButton("💰 Баланс", callback_data="show_balance"),
-         InlineKeyboardButton("📰 Новини", callback_data="show_news")],
+         InlineKeyboardButton("⚙️ Ризик: %.0f%%"%s.risk_percent, callback_data="show_risk")],
+        [InlineKeyboardButton("📰 Новини", callback_data="show_news"),
+         InlineKeyboardButton("🔑 Approve USDC", callback_data="do_approve")],
     ])
 
 WELCOME_TEXT = (
     "👋 Бот запущено!\n\n"
-    "Ви будете отримувати сигнали кожні 15 хв по BTC\n"
-    "(вище / нижче поточної ціни)\n\n"
+    "Сигнали кожні 15 хв по BTC (вище / нижче)\n\n"
     "Маркет: BTC Up or Down — 15 minutes\n"
-    "Платформа: Polymarket (Polygon)\n\n"
-    "Щоб торгувати — підключіть гаманець нижче 👇"
+    "Платформа: Polymarket (Polygon)\n"
+    "USDC: 0x3c499c...3359 ✅\n\n"
+    "Щоб торгувати — підключіть гаманець 👇"
 )
 
 HOW_TO_TEXT = (
     "📘 ЯК КОРИСТУВАТИСЬ\n\n"
     "1. Підключіть гаманець MetaMask\n"
-    "   → Експортуйте приватний ключ\n"
-    "   → Settings → Security → Export Private Key\n\n"
-    "2. Бот аналізує ринок кожні 15 хв\n"
-    "   → Відправляє сигнал UP або DOWN\n"
-    "   → Ви підтверджуєте суму\n\n"
-    "3. Ставка виконується автоматично\n"
-    "   → YES = BTC вище\n"
-    "   → NO = BTC нижче\n\n"
-    "4. Результат через 15 хв\n\n"
-    "⚠️ Ніколи не діліться ключем з іншими!\n"
-    "Бот використовує його тільки для підпису транзакцій."
+    "   MetaMask → ··· → Account Details → Export Private Key\n\n"
+    "2. Зробіть Approve USDC (1 раз)\n"
+    "   Дозволяє Polymarket використовувати ваш USDC\n\n"
+    "3. Встановіть % ризику\n"
+    "   /setrisk або кнопка ⚙️ Ризик\n"
+    "   Дефолт: 5% від балансу на угоду\n\n"
+    "4. Увімкніть авто-торгівлю\n"
+    "   /autoon або кнопка 🟢\n\n"
+    "5. Бот торгує автоматично кожні 15 хв\n"
+    "   YES = BTC вище | NO = BTC нижче\n\n"
+    "⚠️ Ніколи не діліться приватним ключем!"
 )
 
 # ============================================================
@@ -984,24 +1120,117 @@ async def cmd_errors(u, c):
 async def cmd_balance(u, c):
     s = get_session(u.effective_user.id)
     await u.message.reply_text("Перевіряю баланс...")
-    bal, addr = get_balance(s)
+    bal, info = get_balance(s)
     if bal is not None:
-        await u.message.reply_text("💰 Баланс: $%.2f USDC\n📍 %s...%s" % (bal, addr[:10], addr[-6:]))
+        bet = s.calc_bet_size(bal)
+        await u.message.reply_text(
+            "💰 Баланс: $%.2f USDC\n"
+            "📍 %s...%s\n"
+            "⚙️ Ризик: %.0f%% → $%.2f на угоду" % (
+                bal, info[:10], info[-6:], s.risk_percent, bet))
     else:
-        await u.message.reply_text("❌ %s" % addr)
+        await u.message.reply_text("❌ %s" % info)
 
 async def cmd_news(u, c):
     await u.message.reply_text("📰 Новини BTC:\n\n%s" % get_news())
 
 async def cmd_autoon(u, c):
+    """Починає ConversationHandler для встановлення % ризику"""
     s = get_session(u.effective_user.id)
-    s.auto_active = True
-    await u.message.reply_text("🟢 Авто ON | $%.0f | Min: %s" % (AUTO_BET_SIZE, AUTO_MIN_STRENGTH))
+    if not s.wallet_ok:
+        await u.message.reply_text("❌ Спочатку підключіть гаманець: /wallet"); return
+    await u.message.reply_text(
+        "⚙️ АВТО-ТОРГІВЛЯ\n\n"
+        "Введи % від балансу на кожну угоду\n"
+        "Наприклад: 5, 10, 15, 20\n\n"
+        "Обмеження: мін $1, макс 20% балансу\n"
+        "Поточний: %.0f%%\n\n"
+        "Введи число:" % s.risk_percent
+    )
+    return AUTO_PERCENT
+
+async def got_auto_percent(u, c):
+    s = get_session(u.effective_user.id)
+    try:
+        pct = float(u.message.text.strip().replace("%",""))
+        if pct < 1:
+            await u.message.reply_text("❌ Мінімум 1%. Введи число ще раз:"); return AUTO_PERCENT
+        if pct > 20:
+            await u.message.reply_text("❌ Максимум 20% балансу. Введи число ще раз:"); return AUTO_PERCENT
+        s.risk_percent = pct
+        s.save_risk()
+        s.auto_active  = True
+        bal, _ = get_balance(s)
+        bet = s.calc_bet_size(bal) if bal else "N/A"
+        bet_str = "$%.2f" % bet if isinstance(bet, float) else str(bet)
+        await u.message.reply_text(
+            "✅ Авто-торгівля увімкнена!\n\n"
+            "⚙️ Ризик: %.0f%% від балансу на угоду\n"
+            "💰 Поточний баланс: %s\n"
+            "🎯 Сума ставки: %s\n\n"
+            "Бот торгуватиме автоматично о :00 :15 :30 :45 UTC" % (
+                pct, "$%.2f"%bal if bal else "N/A", bet_str),
+            reply_markup=main_keyboard(s))
+    except ValueError:
+        await u.message.reply_text("❌ Введи число (наприклад 10):"); return AUTO_PERCENT
+    return ConversationHandler.END
 
 async def cmd_autooff(u, c):
     s = get_session(u.effective_user.id)
     s.auto_active = False
-    await u.message.reply_text("🔴 Авто OFF")
+    await u.message.reply_text("🔴 Авто-торгівля вимкнена.", reply_markup=main_keyboard(s))
+
+async def cmd_risk(u, c):
+    """Показує поточний %"""
+    s = get_session(u.effective_user.id)
+    bal, _ = get_balance(s)
+    bet = s.calc_bet_size(bal) if bal else None
+    await u.message.reply_text(
+        "⚙️ УПРАВЛІННЯ РИЗИКОМ\n\n"
+        "Поточний %: %.0f%% від балансу\n"
+        "Баланс: %s\n"
+        "Сума ставки: %s\n\n"
+        "Змінити: /setrisk" % (
+            s.risk_percent,
+            "$%.2f" % bal if bal else "N/A",
+            "$%.2f" % bet if bet else "N/A"))
+
+async def cmd_setrisk(u, c):
+    """Встановлює новий % ризику"""
+    await u.message.reply_text(
+        "⚙️ ЗМІНА РИЗИКУ\n\n"
+        "Введи новий % від балансу (1-20):\n"
+        "Наприклад: 5"
+    )
+    return SET_RISK_VAL
+
+async def got_setrisk_val(u, c):
+    s = get_session(u.effective_user.id)
+    try:
+        pct = float(u.message.text.strip().replace("%",""))
+        if pct < 1 or pct > 20:
+            await u.message.reply_text("❌ Введи від 1 до 20. Спробуй ще:"); return SET_RISK_VAL
+        s.risk_percent = pct
+        s.save_risk()
+        await u.message.reply_text(
+            "✅ Ризик оновлено: %.0f%% від балансу на угоду\n"
+            "Збережено у файл." % pct,
+            reply_markup=main_keyboard(s))
+    except ValueError:
+        await u.message.reply_text("❌ Введи число:"); return SET_RISK_VAL
+    return ConversationHandler.END
+
+async def cmd_approve(u, c):
+    """Approve USDC для Polymarket"""
+    s = get_session(u.effective_user.id)
+    if not s.wallet_ok:
+        await u.message.reply_text("❌ Спочатку підключіть гаманець: /wallet"); return
+    await u.message.reply_text("⏳ Виконую approve USDC...\nЦе може зайняти 30-60 сек.")
+    ok, msg = approve_usdc(s)
+    if ok:
+        await u.message.reply_text("✅ USDC approved!\n%s\n\nТепер можна торгувати." % msg)
+    else:
+        await u.message.reply_text("❌ Approve помилка:\n%s" % msg)
 
 async def cmd_trades(u, c):
     s = get_session(u.effective_user.id)
@@ -1017,10 +1246,9 @@ async def cmd_resetstats(u, c):
         try:
             if os.path.exists(f): os.remove(f)
         except Exception: pass
-    await u.message.reply_text("✅ Статистика очищена.\n(signals_dump.json збережено)")
+    await u.message.reply_text("✅ Статистика очищена.")
 
 async def cmd_dump(u, c):
-    """Надсилає signals_dump.json файлом в чат"""
     s = get_session(u.effective_user.id)
     if not os.path.exists(SIGNALS_DUMP):
         await u.message.reply_text("signals_dump.json порожній."); return
@@ -1028,7 +1256,7 @@ async def cmd_dump(u, c):
         with open(SIGNALS_DUMP,"rb") as f:
             await u.message.reply_document(
                 document=f, filename="signals_dump.json",
-                caption="Повний дамп всіх сигналів (%d байт)" % os.path.getsize(SIGNALS_DUMP))
+                caption="Повний дамп %d байт" % os.path.getsize(SIGNALS_DUMP))
     except Exception as e:
         await u.message.reply_text("Помилка: %s" % e)
 
@@ -1042,15 +1270,17 @@ async def cmd_status(u, c):
     sw15=liq.get("sweep_15m",{}); sa=liq.get("stops_above") or {}; sb=liq.get("stops_below") or {}
     bc5=liq.get("bos_choch_5m")
     market = _find_btc15m_market()
-    market_info = "✅ %s" % market["name"][:50] if market else "❌ Маркет не знайдено"
-    wallet_info = "✅ %s...%s" % (s.wallet_address[:10],s.wallet_address[-6:]) if s.wallet_ok else "❌ Не підключено"
+    minfo = "✅ %s"%market["name"][:40] if market else "❌ Не знайдено"
+    winfo = "✅ %s...%s"%(s.wallet_address[:10],s.wallet_address[-6:]) if s.wallet_ok else "❌ Не підключено"
+    bal, _ = get_balance(s)
+    bet = s.calc_bet_size(bal) if bal else 0.0
     await u.message.reply_text(
         "%s\n💲$%.2f|15m:%+.4f%%|5m:%+.4f%%\nMom:%+.4f%%|Micro:%+.4f%%\n\n"
         "15M=%s|5M=%s|1M=%s\nMkt:%s|Vol:%s|Sess:%s\n"
         "AMD:%s->%s [%s]\nBOS5m:%s\n\n"
         "Sweep15m:%s@%.2f(%dc)\nUp:%.2f(%.3f%%)\nDn:%.2f(%.3f%%)\n\n"
         "Trap:%s|Fund:%+.6f(%s)\nLiqs:%s|OI:%+.4f%%\nBook:%s(%+.1f%%)|L/S:%.2f(%s)\n\n"
-        "🏪 Маркет: %s\n👛 Гаманець: %s\n🤖 Авто: %s" % (
+        "🏪 %s\n👛 %s\n💰 Баланс: %s\n🎯 Ставка: $%.2f (%.0f%%)\n🤖 Авто: %s" % (
             p["timestamp"],pr["current"],pr["chg_15m"],pr["chg_5m"],pr["momentum_3"],pr["micro_mom"],
             st["15m"],st["5m"],st["1m"],ctx["market_condition"],ctx["volatility"],ctx["session"],
             amd.get("phase","NONE"),amd.get("direction","?"),amd.get("reason",""),
@@ -1059,91 +1289,82 @@ async def cmd_status(u, c):
             sa.get("price",0),liq.get("dist_above",0),sb.get("price",0),liq.get("dist_below",0),
             manip["trap_type"],pos["funding_rate"],pos["funding_sent"],
             pos["liq_signal"],pos["oi_change"],pos["ob_bias"],pos["ob_imbalance"],pos["lsr_ratio"],pos["lsr_bias"],
-            market_info,wallet_info,
-            "ON($%.0f)"%AUTO_BET_SIZE if s.auto_active else "OFF"
+            minfo,winfo,
+            "$%.2f"%bal if bal else "N/A",
+            bet, s.risk_percent,
+            "ON(%.0f%%)"%s.risk_percent if s.auto_active else "OFF"
         )
     )
 
 # ============================================================
-# ПІДКЛЮЧЕННЯ ГАМАНЦЯ — ConversationHandler
+# WALLET CONVERSATION
 # ============================================================
 async def wallet_start(u, c):
-    """Починає процес підключення гаманця"""
     query = u.callback_query
-    if query:
-        await query.answer()
-        await query.message.reply_text(
-            "🔐 ПІДКЛЮЧЕННЯ ГАМАНЦЯ\n\n"
-            "Крок 1/2: Введіть ваш приватний ключ MetaMask\n\n"
-            "Де знайти:\n"
-            "MetaMask → три крапки → Account Details → Export Private Key\n\n"
-            "⚠️ Ніколи не діліться ключем з іншими!\n"
-            "Бот використовує його виключно для підпису транзакцій на Polymarket.\n\n"
-            "Введіть приватний ключ (64 символи hex):"
-        )
-    else:
-        await u.message.reply_text(
-            "🔐 Введіть приватний ключ MetaMask (64 символи hex):"
-        )
+    msg_obj = query.message if query else u.message
+    if query: await query.answer()
+    await msg_obj.reply_text(
+        "🔐 ПІДКЛЮЧЕННЯ ГАМАНЦЯ\n\n"
+        "Крок 1/2: Приватний ключ MetaMask\n\n"
+        "Де знайти:\n"
+        "MetaMask → ··· → Account Details → Export Private Key\n\n"
+        "⚠️ Ключ використовується ТІЛЬКИ для підпису транзакцій.\n"
+        "Бот ніколи не передає його третім особам.\n\n"
+        "Введіть приватний ключ (64 символи hex або з 0x):"
+    )
     return WALLET_KEY
 
 async def wallet_got_key(u, c):
-    """Отримали приватний ключ — просимо RPC"""
     key = u.message.text.strip()
-    # Базова перевірка довжини
     clean = key.lower().replace("0x","").replace(" ","")
     if len(clean) != 64:
-        await u.message.reply_text(
-            "❌ Неправильна довжина ключа (%d символів замість 64).\n\nСпробуйте ще раз або /cancel" % len(clean)
-        )
+        await u.message.reply_text("❌ Невірна довжина (%d замість 64).\nСпробуйте ще раз:" % len(clean))
         return WALLET_KEY
     c.user_data["pending_key"] = key
     await u.message.reply_text(
         "✅ Ключ прийнято.\n\n"
         "Крок 2/2: RPC URL для Polygon\n\n"
-        "Натисніть Enter або відправте будь-який текст щоб використати дефолтний:\n"
+        "Відправте будь-який текст для дефолтного:\n"
         "https://polygon-rpc.com\n\n"
         "Або введіть свій Alchemy/Infura URL:"
     )
     return WALLET_RPC
 
 async def wallet_got_rpc(u, c):
-    """Отримали RPC — підключаємось"""
     rpc_input = u.message.text.strip()
     rpc = rpc_input if rpc_input.startswith("http") else DEFAULT_RPC_URL
     key = c.user_data.get("pending_key","")
     s   = get_session(u.effective_user.id)
-
-    await u.message.reply_text("⏳ Підключення до Polygon...")
+    await u.message.reply_text("⏳ Підключення до Polygon Mainnet...")
     ok, result = validate_and_connect_wallet(s, key, rpc)
-
     if ok:
         bal, _ = get_balance(s)
-        bal_str = "$%.2f USDC" % bal if bal is not None else "баланс недоступний"
+        bet    = s.calc_bet_size(bal) if bal else 0.0
         await u.message.reply_text(
-            "✅ Гаманець підключено успішно!\n\n"
+            "✅ Гаманець підключено!\n\n"
             "📍 Адреса: %s\n"
-            "💰 Баланс: %s\n"
-            "🌐 Мережа: Polygon Mainnet\n\n"
-            "Тепер ви можете торгувати на Polymarket автоматично." % (result, bal_str),
-            reply_markup=main_keyboard(s)
-        )
+            "💰 Баланс USDC: %s\n"
+            "🌐 Мережа: Polygon Mainnet\n"
+            "📄 USDC контракт: 0x3c499c...3359\n\n"
+            "Наступний крок: /approve (один раз)\n"
+            "Потім: /autoon або /setrisk" % (
+                result,
+                "$%.2f"%bal if bal else "баланс недоступний"),
+            reply_markup=main_keyboard(s))
     else:
-        await u.message.reply_text(
-            "❌ Помилка підключення:\n\n%s\n\nСпробуйте ще раз: /wallet" % result,
-            reply_markup=main_keyboard(s)
-        )
+        await u.message.reply_text("❌ Помилка:\n\n%s\n\nСпробуйте: /wallet" % result,
+                                   reply_markup=main_keyboard(s))
     c.user_data.pop("pending_key", None)
     return ConversationHandler.END
 
 async def wallet_cancel(u, c):
     s = get_session(u.effective_user.id)
     c.user_data.pop("pending_key", None)
-    await u.message.reply_text("❌ Підключення скасовано.", reply_markup=main_keyboard(s))
+    await u.message.reply_text("❌ Скасовано.", reply_markup=main_keyboard(s))
     return ConversationHandler.END
 
 # ============================================================
-# CALLBACK BUTTONS
+# CALLBACKS
 # ============================================================
 async def handle_callback(u, c):
     s = get_session(u.effective_user.id)
@@ -1155,7 +1376,6 @@ async def handle_callback(u, c):
 
     elif q.data == "wallet_connect":
         await wallet_start(u, c)
-        return  # ConversationHandler підхопить далі
 
     elif q.data == "show_stats":
         check_signals(s)
@@ -1163,31 +1383,54 @@ async def handle_callback(u, c):
 
     elif q.data == "download_log":
         if not s.signal_history:
-            await q.message.reply_text("Немає сигналів для експорту.")
-            return
+            await q.message.reply_text("Немає сигналів."); return
         csv_bytes = build_csv(s)
-        fname = "btc_signals_%d_%s.csv" % (s.uid, datetime.datetime.now().strftime("%Y%m%d_%H%M"))
-        await q.message.reply_document(
-            document=csv_bytes, filename=fname,
-            caption="📁 Лог сигналів (%d записів)" % len(s.signal_history)
-        )
+        fname = "btc_signals_%s.csv" % datetime.datetime.now().strftime("%Y%m%d_%H%M")
+        await q.message.reply_document(document=csv_bytes, filename=fname,
+                                       caption="📁 %d записів" % len(s.signal_history))
 
     elif q.data == "toggle_auto":
-        s.auto_active = not s.auto_active
-        status = "🟢 Авто ON ($%.0f/сигнал)" % AUTO_BET_SIZE if s.auto_active else "🔴 Авто OFF"
-        await q.message.reply_text(status, reply_markup=main_keyboard(s))
+        if not s.wallet_ok:
+            await q.message.reply_text("❌ Підключіть гаманець: /wallet"); return
+        if s.auto_active:
+            s.auto_active = False
+            await q.message.reply_text("🔴 Авто вимкнено", reply_markup=main_keyboard(s))
+        else:
+            await q.message.reply_text(
+                "Введи % від балансу на угоду (1-20):\nПоточний: %.0f%%" % s.risk_percent)
+            c.user_data["auto_percent_pending"] = True
 
     elif q.data == "analyze_now":
         await q.message.reply_text("🔍 Аналіз...")
         await run_cycle_for_user(c.application, s)
 
     elif q.data == "show_balance":
-        await q.message.reply_text("Перевіряю...")
-        bal, addr = get_balance(s)
+        bal, info = get_balance(s)
         if bal is not None:
-            await q.message.reply_text("💰 $%.2f USDC\n📍 %s...%s" % (bal, addr[:10], addr[-6:]))
+            bet = s.calc_bet_size(bal)
+            await q.message.reply_text("💰 $%.2f USDC\n📍 %s...%s\n🎯 Ставка: $%.2f"%(
+                bal, info[:10], info[-6:], bet))
         else:
-            await q.message.reply_text("❌ %s" % addr)
+            await q.message.reply_text("❌ %s" % info)
+
+    elif q.data == "show_risk":
+        bal, _ = get_balance(s)
+        bet = s.calc_bet_size(bal) if bal else None
+        await q.message.reply_text(
+            "⚙️ Ризик: %.0f%% від балансу\n💰 Баланс: %s\n🎯 Сума: %s\n\nЗмінити: /setrisk" % (
+                s.risk_percent,
+                "$%.2f"%bal if bal else "N/A",
+                "$%.2f"%bet if bet else "N/A"))
+
+    elif q.data == "do_approve":
+        if not s.wallet_ok:
+            await q.message.reply_text("❌ Підключіть гаманець: /wallet"); return
+        await q.message.reply_text("⏳ Approve USDC...")
+        ok, msg = approve_usdc(s)
+        if ok:
+            await q.message.reply_text("✅ Approved!\n%s" % msg)
+        else:
+            await q.message.reply_text("❌ %s" % msg)
 
     elif q.data == "show_news":
         await q.message.reply_text("📰 Новини:\n\n%s" % get_news())
@@ -1200,48 +1443,63 @@ async def handle_callback(u, c):
         await q.edit_message_text("Введи суму в USDC:")
 
     elif q.data.startswith("execute_"):
-        parts     = q.data.split("_"); direction = parts[1]; amount = float(parts[2])
-        await q.edit_message_text("⏳ Виконую ставку...")
+        parts = q.data.split("_"); direction = parts[1]; amount = float(parts[2])
+        await q.edit_message_text("⏳ Виконую ставку $%.2f..." % amount)
         bet = place_bet(s, direction, amount)
         if bet["success"]:
-            pot = bet.get("pot", 0)
             s.trade_history.append({"decision":direction,"amount":amount,
                                      "entry":s.pending_trade.get("price",0),
                                      "time":datetime.datetime.now(datetime.timezone.utc)})
-            await c.bot.send_message(
-                chat_id=u.effective_chat.id,
-                text="✅ СТАВКА ВИКОНАНА\n%s | %s\n$%.2f → потенційно +$%.2f" % (
-                    direction, bet.get("market_name","Polymarket"), amount, pot))
+            await c.bot.send_message(chat_id=u.effective_chat.id,
+                text="✅ СТАВКА ВИКОНАНА\n%s | %s\n$%.2f → потенційно +$%.2f\nGTC order активний"%(
+                    direction, bet.get("market_name","Polymarket"), amount, bet.get("pot",0)))
         else:
-            await c.bot.send_message(
-                chat_id=u.effective_chat.id,
+            await c.bot.send_message(chat_id=u.effective_chat.id,
                 text="❌ СТАВКА НЕ ВИКОНАНА\n%s" % bet["error"])
         s.pending_trade = {}
 
 # ============================================================
-# ОБРОБКА ТЕКСТОВИХ ПОВІДОМЛЕНЬ (сума ставки)
+# HANDLE MESSAGE
 # ============================================================
 async def handle_message(u, c):
     s = get_session(u.effective_user.id)
-    if not s.pending_trade or time.time()-s.pending_trade.get("timestamp",0)>600:
-        s.pending_trade = {}
-        return  # ігноруємо якщо нема активного сигналу
-    try:
-        amount = float(u.message.text.strip())
-        if amount < 1 or amount > 500:
-            await u.message.reply_text("⚠️ Сума від $1 до $500"); return
-        direction = s.pending_trade["direction"]
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ $%.2f на %s" % (amount, direction),
-                                 callback_data="execute_%s_%.2f" % (direction, amount)),
-            InlineKeyboardButton("❌ Скасувати", callback_data="skip")
-        ]])
-        await u.message.reply_text("Підтвердити ставку?", reply_markup=kb)
-    except ValueError:
-        pass  # не число — ігноруємо
+    text = u.message.text.strip()
+
+    # Якщо очікуємо % для auto через inline-кнопку
+    if c.user_data.get("auto_percent_pending"):
+        try:
+            pct = float(text.replace("%",""))
+            if 1 <= pct <= 20:
+                s.risk_percent = pct; s.save_risk(); s.auto_active = True
+                c.user_data.pop("auto_percent_pending", None)
+                bal, _ = get_balance(s)
+                bet = s.calc_bet_size(bal) if bal else 0.0
+                await u.message.reply_text(
+                    "✅ Авто ON!\nРизик: %.0f%% → $%.2f на угоду" % (pct, bet),
+                    reply_markup=main_keyboard(s))
+                return
+            else:
+                await u.message.reply_text("❌ Від 1 до 20. Введи ще раз:"); return
+        except ValueError:
+            await u.message.reply_text("❌ Введи число (наприклад 10):"); return
+
+    # Сума ставки при активному сигналі
+    if s.pending_trade and time.time()-s.pending_trade.get("timestamp",0) <= 600:
+        try:
+            amount = float(text)
+            if amount < 1 or amount > 500:
+                await u.message.reply_text("⚠️ Сума від $1 до $500"); return
+            direction = s.pending_trade["direction"]
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ $%.2f на %s"%(amount,direction),
+                                     callback_data="execute_%s_%.2f"%(direction,amount)),
+                InlineKeyboardButton("❌ Скасувати", callback_data="skip")]])
+            await u.message.reply_text("Підтвердити?", reply_markup=kb)
+        except ValueError:
+            pass
 
 # ============================================================
-# EXECUTE AUTO TRADE
+# AUTO TRADE
 # ============================================================
 async def execute_auto_trade(app, s: UserSession, payload, result):
     decision = result.get("decision"); strength = result.get("strength","LOW"); logic = result.get("logic","")
@@ -1249,27 +1507,40 @@ async def execute_auto_trade(app, s: UserSession, payload, result):
     strength_order = {"HIGH":3,"MEDIUM":2,"LOW":1}
     if strength_order.get(strength,1) < strength_order.get(AUTO_MIN_STRENGTH,2):
         await app.bot.send_message(chat_id=s.uid,
-                                   text="⚡ Сигнал %s(%s) слабкий. Пропускаю." % (decision,strength))
+            text="⚡ Сигнал %s(%s) слабкий. Пропускаю." % (decision,strength))
         return
-    bet = place_bet(s, decision, AUTO_BET_SIZE)
+
+    # Отримуємо баланс і рахуємо суму
+    bal, _ = get_balance(s)
+    if bal is None or bal <= 0:
+        await app.bot.send_message(chat_id=s.uid,
+            text="❌ Авто: не вдалося отримати баланс. Ставка пропущена.")
+        return
+
+    amount = s.calc_bet_size(bal)
+    if amount < 1:
+        await app.bot.send_message(chat_id=s.uid,
+            text="❌ Авто: сума ставки $%.2f < $1. Поповніть баланс." % amount)
+        return
+
+    bet = place_bet(s, decision, amount)
     if bet["success"]:
         pot = bet.get("pot",0)
-        s.trade_history.append({"decision":decision,"amount":AUTO_BET_SIZE,
+        s.trade_history.append({"decision":decision,"amount":amount,
                                  "entry":payload["price"]["current"],
                                  "time":datetime.datetime.now(datetime.timezone.utc)})
-        bal, _ = get_balance(s)
-        await app.bot.send_message(
-            chat_id=s.uid,
-            text="✅ АВТО-СТАВКА\n%s | %s\n$%.2f → +$%.2f\n💰 Баланс: %s\n\n%s" % (
-                decision, bet.get("market_name","Polymarket"), AUTO_BET_SIZE, pot,
-                "$%.2f"%bal if bal is not None else "N/A", logic))
+        await app.bot.send_message(chat_id=s.uid,
+            text="✅ АВТО-СТАВКА\n%s | %s\n💰 Баланс: $%.2f\n🎯 Ставка: $%.2f (%.0f%%)\n📈 Потенційно: +$%.2f\nGTC order активний\n\n%s"%(
+                decision, bet.get("market_name","Polymarket"),
+                bal, amount, s.risk_percent, pot, logic))
+        logger.info("Auto trade: uid=%d dir=%s amount=%.2f bal=%.2f",
+                    s.uid, decision, amount, bal)
     else:
-        await app.bot.send_message(
-            chat_id=s.uid,
-            text="❌ АВТО-СТАВКА НЕ ВИКОНАНА\n%s\n%s|%s" % (bet["error"],decision,strength))
+        await app.bot.send_message(chat_id=s.uid,
+            text="❌ АВТО-СТАВКА НЕ ВИКОНАНА\n%s\n%s|%s"%(bet["error"],decision,strength))
 
 # ============================================================
-# MAIN CYCLE для конкретного користувача
+# MAIN CYCLE
 # ============================================================
 async def run_cycle_for_user(app, s: UserSession):
     check_signals(s)
@@ -1308,6 +1579,7 @@ async def run_cycle_for_user(app, s: UserSession):
         "oi_change":payload["positioning"]["oi_change"],
         "ob_bias":payload["positioning"]["ob_bias"],
         "lsr_bias":payload["positioning"]["lsr_bias"],
+        "risk_percent":s.risk_percent,
     }
     s.signal_history.append(sig_record)
     _save_history(s)
@@ -1315,14 +1587,10 @@ async def run_cycle_for_user(app, s: UserSession):
     dec_ua  = "ВИЩЕ ↑" if decision=="UP" else "НИЖЧЕ ↓"
     str_ua  = {"HIGH":"🔴 СИЛЬНИЙ","MEDIUM":"🟡 СЕРЕДНІЙ","LOW":"🟢 СЛАБКИЙ"}.get(strength,strength)
     reas_s  = "\n".join("• "+r for r in reasons[:3]) if reasons else ""
-    risk_s  = "⚠️ %s" % risk_note if risk_note and risk_note.lower() not in ("none","","no") else ""
+    risk_s  = "⚠️ %s"%risk_note if risk_note and risk_note.lower() not in ("none","","no") else ""
 
     main_txt = (
-        "📊 СИГНАЛ\n\n"
-        "%s | %s | Score:%+d\n"
-        "$%.2f | %s | %s\n\n"
-        "🎯 %s\n\n"
-        "%s\n\n%s\n\n%s"
+        "📊 СИГНАЛ\n\n%s | %s | Score:%+d\n$%.2f | %s | %s\n\n🎯 %s\n\n%s\n\n%s\n\n%s"
     ) % (dec_ua, str_ua, score, payload["price"]["current"], mkt_cond, ctx["session"],
          key_sig, logic, reas_s, risk_s)
 
@@ -1331,43 +1599,41 @@ async def run_cycle_for_user(app, s: UserSession):
         await execute_auto_trade(app, s, payload, result)
     else:
         btn_dir = "YES" if decision=="UP" else "NO"
+        # Рахуємо рекомендовану суму
+        bal, _ = get_balance(s)
+        rec_amount = s.calc_bet_size(bal) if bal else AUTO_MIN_STRENGTH
         s.pending_trade = {"direction":btn_dir,"amount":None,
                            "timestamp":time.time(),"price":payload["price"]["current"]}
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Так", callback_data="confirm_%s"%btn_dir),
-            InlineKeyboardButton("❌ Ні",  callback_data="skip")
-        ]])
-        await app.bot.send_message(
-            chat_id=s.uid,
-            text=main_txt+"\n\nВведи суму USDC для ставки:",
-            reply_markup=kb)
+            InlineKeyboardButton("❌ Ні",  callback_data="skip")]])
+        bal_str = " (рек. $%.2f = %.0f%% балансу)"%(rec_amount, s.risk_percent) if bal else ""
+        await app.bot.send_message(chat_id=s.uid,
+            text=main_txt+"\n\nВведи суму USDC"+bal_str+":", reply_markup=kb)
 
     wrong = [sg for sg in s.signal_history if sg.get("outcome")=="LOSS"]
     if len(wrong)>0 and len(wrong)%5==0:
-        await app.bot.send_message(chat_id=s.uid, text="📉 %d помилок у лозі. /errors" % len(wrong))
+        await app.bot.send_message(chat_id=s.uid, text="📉 %d помилок. /errors"%len(wrong))
 
 # ============================================================
-# SCHEDULER — :00 :15 :30 :45 UTC — для ВСІХ активних сесій
+# SCHEDULER
 # ============================================================
 async def periodic(app):
     while True:
-        now          = datetime.datetime.now(datetime.timezone.utc)
-        mins_to_next = 15 - (now.minute % 15)
-        if mins_to_next == 15: mins_to_next = 0
-        next_run = now.replace(second=2,microsecond=0) + datetime.timedelta(minutes=mins_to_next)
-        if next_run <= now: next_run += datetime.timedelta(minutes=15)
-        wait = (next_run - now).total_seconds()
-        logger.info("Наступний аналіз через %.0f сек о %s UTC", wait, next_run.strftime("%H:%M"))
+        now=datetime.datetime.now(datetime.timezone.utc)
+        mins_to_next=15-(now.minute%15)
+        if mins_to_next==15: mins_to_next=0
+        next_run=now.replace(second=2,microsecond=0)+datetime.timedelta(minutes=mins_to_next)
+        if next_run<=now: next_run+=datetime.timedelta(minutes=15)
+        wait=(next_run-now).total_seconds()
+        logger.info("Наступний цикл через %.0f сек о %s UTC",wait,next_run.strftime("%H:%M"))
         await asyncio.sleep(wait)
-        # Виконуємо для всіх активних сесій
         if _sessions:
-            for uid, s in list(_sessions.items()):
+            for uid,s in list(_sessions.items()):
                 try:
                     await run_cycle_for_user(app, s)
                 except Exception as e:
-                    logger.error("Cycle error uid=%d: %s", uid, e)
-        else:
-            logger.info("Немає активних сесій")
+                    logger.error("Cycle uid=%d: %s", uid, e)
 
 # ============================================================
 # MAIN
@@ -1375,7 +1641,7 @@ async def periodic(app):
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # ConversationHandler для підключення гаманця
+    # Wallet conversation
     wallet_conv = ConversationHandler(
         entry_points=[
             CommandHandler("wallet", wallet_start),
@@ -1389,7 +1655,25 @@ def main():
         per_user=True,
     )
 
+    # Autoon conversation
+    autoon_conv = ConversationHandler(
+        entry_points=[CommandHandler("autoon", cmd_autoon)],
+        states={AUTO_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_auto_percent)]},
+        fallbacks=[CommandHandler("cancel", wallet_cancel)],
+        per_user=True,
+    )
+
+    # Setrisk conversation
+    setrisk_conv = ConversationHandler(
+        entry_points=[CommandHandler("setrisk", cmd_setrisk)],
+        states={SET_RISK_VAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_setrisk_val)]},
+        fallbacks=[CommandHandler("cancel", wallet_cancel)],
+        per_user=True,
+    )
+
     app.add_handler(wallet_conv)
+    app.add_handler(autoon_conv)
+    app.add_handler(setrisk_conv)
     app.add_handler(CommandHandler("start",      cmd_start))
     app.add_handler(CommandHandler("help",       cmd_help))
     app.add_handler(CommandHandler("status",     cmd_status))
@@ -1398,17 +1682,18 @@ def main():
     app.add_handler(CommandHandler("stats",      cmd_stats))
     app.add_handler(CommandHandler("errors",     cmd_errors))
     app.add_handler(CommandHandler("trades",     cmd_trades))
-    app.add_handler(CommandHandler("autoon",     cmd_autoon))
     app.add_handler(CommandHandler("autooff",    cmd_autooff))
     app.add_handler(CommandHandler("analyze",    cmd_analyze))
     app.add_handler(CommandHandler("resetstats", cmd_resetstats))
     app.add_handler(CommandHandler("dump",       cmd_dump))
+    app.add_handler(CommandHandler("approve",    cmd_approve))
+    app.add_handler(CommandHandler("risk",       cmd_risk))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     async def on_startup(app):
         asyncio.create_task(periodic(app))
-        logger.info("Bot started — multi-user mode")
+        logger.info("Bot started — multi-user, GTC orders, USDC 0x3c499c...")
 
     app.post_init = on_startup
     app.run_polling(allowed_updates=Update.ALL_TYPES)
