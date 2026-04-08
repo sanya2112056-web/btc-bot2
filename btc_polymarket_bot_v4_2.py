@@ -1396,9 +1396,13 @@ async def handle_callback(u, c):
             s.auto_active = False
             await q.message.reply_text("🔴 Авто вимкнено", reply_markup=main_keyboard(s))
         else:
-            await q.message.reply_text(
-                "Введи % від балансу на угоду (1-20):\nПоточний: %.0f%%" % s.risk_percent)
-            c.user_data["auto_percent_pending"] = True
+        s.auto_active = True
+        bal, _ = get_balance(s)
+        bet = s.calc_bet_size(bal) if bal else 0.0
+        await q.message.reply_text(
+            "🟢 Авто ON!\nРизик: %.0f%% → $%.2f на угоду\n\nЗмінити %: /setrisk" % (
+                s.risk_percent, bet),
+            reply_markup=main_keyboard(s))
 
     elif q.data == "analyze_now":
         await q.message.reply_text("🔍 Аналіз...")
