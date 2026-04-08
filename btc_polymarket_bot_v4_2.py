@@ -1395,10 +1395,10 @@ async def handle_callback(u, c):
         if s.auto_active:
             s.auto_active = False
             await q.message.reply_text("🔴 Авто вимкнено", reply_markup=main_keyboard(s))
-            else:
-        s.auto_active = True
-        bal, _ = get_balance(s)
-        bet = s.calc_bet_size(bal) if bal else 0.0
+        else:
+            s.auto_active = True
+            bal, _ = get_balance(s)
+            bet = s.calc_bet_size(bal) if bal else 0.0
         await q.message.reply_text(
             "🟢 Авто ON!\nРизик: %.0f%% → $%.2f на угоду\n\nЗмінити %: /setrisk" % (
                 s.risk_percent, bet),
