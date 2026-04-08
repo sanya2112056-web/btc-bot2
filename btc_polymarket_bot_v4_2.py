@@ -7,8 +7,8 @@ from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
 # ============================================================
 # CONFIG — Railway: env vars, локально: вставте значення
 # ============================================================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "INSERT_TOKEN")
-OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY",     "INSERT_OPENAI_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8570026592:AAGt2XI6TuFLvRVNZ6PS7Sgm93cA6HqVb9o")
+OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY",     "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")
 
 # Глобальні дефолти (якщо користувач не підключив свій гаманець)
 DEFAULT_PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "")
