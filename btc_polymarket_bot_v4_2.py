@@ -470,52 +470,73 @@ def _extract_tokens(m, mid):
             print("[Market] CLOB token fetch: %s" % e)
     return ty, tn
 
+from datetime import datetime, timezone
+
 def _find_btc15m_market():
-    """
-    Знаходить активний BTC 15m маркет.
-    Стратегія: closed=false + btc/bitcoin в назві + рівно 2 токени.
-    Кеш 13 хвилин.
-    """
-    now_ts = time.time()
-    if _market_cache["id"] and now_ts < _market_cache["expires"]:
-        return _market_cache
+    now = datetime.now(timezone.utc)
 
-    print("[Market] Searching %s UTC" % datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S"))
-    found = None
+    try:
+        r = requests.get(
+            "https://gamma-api.polymarket.com/markets",
+            params={"closed": "false", "limit": 500},
+            timeout=15
+        )
 
-    for params in [
-        {"closed":"false","limit":100},
-        {"closed":"false","limit":100,"offset":100},
-        {"active":"true","closed":"false","limit":100},
-        {"active":"true","limit":100},
-    ]:
-        try:
-            r = requests.get("https://gamma-api.polymarket.com/markets",
-                             params=params, timeout=15)
-            print("[Market] HTTP %d params=%s" % (r.status_code, params))
-            if r.status_code != 200: continue
-            raw   = r.json()
-            mlist = raw if isinstance(raw,list) else raw.get("markets", raw.get("data",[]))
-            if not mlist: continue
-            print("[Market] Got %d markets" % len(mlist))
-            for m in mlist:
-                if m.get("closed",True): continue
-                title = (m.get("question","") or m.get("title","")).lower()
-                if "btc" not in title and "bitcoin" not in title: continue
-                tokens = m.get("tokens") or m.get("outcomes") or []
-                if len(tokens) != 2: continue
-                mid = (m.get("conditionId") or m.get("condition_id") or m.get("id","")).strip()
-                if not mid: continue
-                q = m.get("question","") or m.get("title","BTC")
-                print("[Market] CANDIDATE: %s" % q[:70])
-                found = {"id":mid,"name":q,"raw":m}
-                break
-        except Exception as e:
-            print("[Market] Error: %s" % e)
-        if found: break
+        if r.status_code != 200:
+            return None
 
-    if not found:
-        print("[Market] NOT FOUND")
+        markets = r.json()
+        if isinstance(markets, dict):
+            markets = markets.get("data", [])
+
+        best = None
+        best_diff = 999999
+
+        for m in markets:
+            if m.get("closed", True):
+                continue
+
+            title = (m.get("question") or "").lower()
+            if "btc" not in title:
+                continue
+
+            end_str = m.get("endDate")
+            if not end_str:
+                continue
+
+            try:
+                end = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+            except:
+                continue
+
+            diff = (end - now).total_seconds()
+
+            # активний 15m
+            if 30 < diff < 900:
+                if diff < best_diff:
+                    best = m
+                    best_diff = diff
+
+        if not best:
+            print("NO ACTIVE BTC MARKET")
+            return None
+
+        mid = best.get("conditionId") or best.get("id")
+        name = best.get("question")
+
+        ty, tn = _extract_tokens(best, mid)
+
+        print("FOUND MARKET:", name)
+
+        return {
+            "id": mid,
+            "name": name,
+            "token_yes": ty,
+            "token_no": tn
+        }
+
+    except Exception as e:
+        print("MARKET ERROR:", e)
         return None
 
     ty, tn = _extract_tokens(found["raw"], found["id"])
@@ -550,8 +571,8 @@ def place_bet(s, direction, amount):
         from py_clob_client.clob_types import OrderArgs, OrderType
         key = s.private_key.strip().replace(" ","").replace("\n","").replace("\r","")
         if key.lower().startswith("0x"): key = key[2:]
-        client = ClobClient(host="https://clob.polymarket.com", key=key, chain_id=137)
-        price  = float(token.get("price",0.5))
+       client.set_api_creds(client.create_api_key())
+        price = 0.99 if direction == "UP" else 0.01
         if price<=0 or price>=1: price=0.5
         pot    = round(amount/price-amount,2) if price>0 else 0.0
         tid    = token.get("token_id") or token.get("id") or token.get("tokenId","")
