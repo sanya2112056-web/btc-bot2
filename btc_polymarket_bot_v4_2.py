@@ -427,7 +427,7 @@ def approve_usdc(s):
             "nonce":w3.eth.get_transaction_count(account.address),
             "gas":100000, "gasPrice":w3.eth.gas_price})
         signed  = account.sign_transaction(tx)
-        tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
         if receipt.status == 1:
             with open(APPROVED_FILE,"a") as f: f.write(key_id+"\n")
