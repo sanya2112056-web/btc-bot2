@@ -427,7 +427,7 @@ def approve_usdc(s):
             "nonce":w3.eth.get_transaction_count(account.address),
             "gas":100000, "gasPrice":w3.eth.gas_price})
         signed  = account.sign_transaction(tx)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
         if receipt.status == 1:
             with open(APPROVED_FILE,"a") as f: f.write(key_id+"\n")
@@ -571,8 +571,8 @@ def place_bet(s, direction, amount):
         from py_clob_client.clob_types import OrderArgs, OrderType
         key = s.private_key.strip().replace(" ","").replace("\n","").replace("\r","")
         if key.lower().startswith("0x"): key = key[2:]
-        client.set_api_creds(client.create_api_key())
-        price = 0.99 if direction == "UP" else 0.01
+        client = ClobClient(host="https://clob.polymarket.com", key=key, chain_id=137)
+        price  = float(token.get("price",0.5))
         if price<=0 or price>=1: price=0.5
         pot    = round(amount/price-amount,2) if price>0 else 0.0
         tid    = token.get("token_id") or token.get("id") or token.get("tokenId","")
