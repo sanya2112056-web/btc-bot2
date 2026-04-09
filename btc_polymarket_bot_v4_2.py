@@ -571,7 +571,7 @@ def place_bet(s, direction, amount):
         from py_clob_client.clob_types import OrderArgs, OrderType
         key = s.private_key.strip().replace(" ","").replace("\n","").replace("\r","")
         if key.lower().startswith("0x"): key = key[2:]
-       client.set_api_creds(client.create_api_key())
+        client.set_api_creds(client.create_api_key())
         price = 0.99 if direction == "UP" else 0.01
         if price<=0 or price>=1: price=0.5
         pot    = round(amount/price-amount,2) if price>0 else 0.0
