@@ -615,63 +615,92 @@ def _extract_tokens(m: dict, mid: str):
 
 def _find_btc15m_market():
     """
-    4 рівні пошуку поточного активного BTC 15m маркету:
-    1. Кеш (якщо ще актуальний)
-    2. Events API — через батьківську подію серії
-    3. Markets API — кілька варіантів запиту
-    4. CLOB API — пагінований перебір
+    Надійний пошук активного BTC 15m маркету ТІЛЬКИ ПО ЧАСУ.
+    НЕ використовує текстові фільтри типу "15m"/"minutes" — вони не надійні.
 
-    Фільтри: active, 2 токени, end_time між зараз і +20хв
+    Алгоритм:
+    1. Запитуємо всі активні маркети
+    2. Фільтруємо: closed=false, tokens=2, question містить btc/bitcoin
+    3. Рахуємо diff = endDate - now
+    4. Беремо маркет де 60 < diff < 900 секунд (активний поточний раунд)
+    5. Кешуємо до кінця раунду
     """
-    now = time.time()
+    now_ts = time.time()
 
-    # Рівень 1: Кеш
-    if _market_cache["id"] and now < _market_cache["expires"]:
+    # --- Кеш ---
+    if _market_cache["id"] and now_ts < _market_cache["expires"]:
         return _market_cache
 
-    logger.info("[Market] Searching for active BTC 15m market...")
-    best = None
+    print(f"[Market] Searching... now={datetime.datetime.utcnow().strftime('%H:%M:%S')}")
 
-    # Рівень 2: Events API
-    try:
-        r = requests.get(
-            "https://gamma-api.polymarket.com/events",
-            params={"active": "true", "limit": 100},
-            timeout=15)
-        if r.status_code == 200:
-            events = r.json() if isinstance(r.json(), list) else r.json().get("data", [])
-            for ev in events:
-                title = ev.get("title","") or ev.get("name","")
-                if not _is_btc15m(title):
+    best      = None
+    best_diff = None
+
+    # Запитуємо кілька сторінок маркетів
+    params_list = [
+        {"active": "true", "closed": "false", "limit": 100},
+        {"active": "true", "closed": "false", "limit": 100, "offset": 100},
+        {"active": "true", "closed": "false", "limit": 100, "offset": 200},
+    ]
+
+    for params in params_list:
+        try:
+            r = requests.get(
+                "https://gamma-api.polymarket.com/markets",
+                params=params, timeout=15)
+            if r.status_code != 200:
+                print(f"[Market] HTTP {r.status_code}")
+                continue
+            raw = r.json()
+            markets = raw if isinstance(raw, list) else raw.get("markets", raw.get("data", []))
+            if not markets:
+                break
+
+            for m in markets:
+                # Фільтр 1: не закритий
+                if m.get("closed", True):
                     continue
-                for m in ev.get("markets", []):
-                    if m.get("closed", True):
-                        continue
-                    if len(m.get("tokens",[])) != 2:
-                        continue
-                    end_ts = _parse_end_ts(m)
-                    if not _is_valid_timing(end_ts, now):
-                        continue
-                    mid = m.get("conditionId") or m.get("id")
-                    if not mid:
-                        continue
-                    if best is None or (end_ts and end_ts < best.get("end_ts",9999999999)):
-                        best = {"id": str(mid), "name": m.get("question","BTC 15m"),
-                                "end_ts": end_ts, "raw": m}
-        logger.info("[Market] Events: %s", "FOUND" if best else "not found")
-    except Exception as e:
-        logger.warning("[Market] Events API: %s", e)
 
-    # Рівень 3: Markets API (кілька варіантів)
+                # Фільтр 2: рівно 2 токени (YES/NO)
+                tokens = m.get("tokens") or m.get("outcomes") or []
+                if len(tokens) != 2:
+                    continue
+
+                # Фільтр 3: BTC або Bitcoin в назві (мінімальний текстовий фільтр)
+                title = (m.get("question","") or m.get("title","")).lower()
+                if "btc" not in title and "bitcoin" not in title:
+                    continue
+
+                # Фільтр 4: парсимо endDate
+                end_ts = _parse_end_ts(m)
+                if end_ts == 0:
+                    continue
+
+                # Фільтр 5: КЛЮЧОВИЙ — diff має бути між 60 і 900 секунд
+                # (маркет завершується не раніше ніж через 1 хв і не пізніше 15 хв)
+                diff = end_ts - now_ts
+                if not (60 < diff < 900):
+                    continue
+
+                mid = m.get("conditionId") or m.get("condition_id") or m.get("id")
+                if not mid:
+                    continue
+
+                print(f"[Market] Candidate: {title[:60]} | diff={diff:.0f}s | id={str(mid)[:20]}")
+
+                # Беремо маркет з найменшим diff (найближчий до завершення = поточний раунд)
+                if best_diff is None or diff < best_diff:
+                    best_diff = diff
+                    best = {"id": str(mid), "name": m.get("question","BTC 15m"),
+                            "end_ts": end_ts, "raw": m}
+
+        except Exception as e:
+            print(f"[Market] API error: {e}")
+
     if not best:
-        queries = [
-            {"active": "true", "closed": "false", "limit": 100, "order": "end_date_asc"},
-            {"q": "BTC Up or Down", "active": "true", "limit": 50},
-            {"q": "BTC 15", "active": "true", "limit": 50},
-            {"q": "Bitcoin 15 minutes", "active": "true", "limit": 50},
-            {"active": "true", "limit": 200},
-        ]
-        for params in queries:
+        # Fallback: якщо не знайдено в 60-900с — розширюємо до 0-1500с
+        print("[Market] Strict filter failed, trying relaxed (0-1500s)...")
+        for params in params_list[:1]:
             try:
                 r = requests.get(
                     "https://gamma-api.polymarket.com/markets",
@@ -681,75 +710,33 @@ def _find_btc15m_market():
                 raw = r.json()
                 markets = raw if isinstance(raw, list) else raw.get("markets", raw.get("data", []))
                 for m in markets:
-                    if m.get("closed", True):
-                        continue
-                    title = m.get("question","") or m.get("title","")
-                    if not _is_btc15m(title):
-                        continue
+                    if m.get("closed", True): continue
                     tokens = m.get("tokens") or m.get("outcomes") or []
-                    if len(tokens) != 2:
-                        continue
+                    if len(tokens) != 2: continue
+                    title = (m.get("question","") or m.get("title","")).lower()
+                    if "btc" not in title and "bitcoin" not in title: continue
                     end_ts = _parse_end_ts(m)
-                    if not _is_valid_timing(end_ts, now):
-                        continue
+                    if end_ts == 0: continue
+                    diff = end_ts - now_ts
+                    if not (0 < diff < 1500): continue
                     mid = m.get("conditionId") or m.get("condition_id") or m.get("id")
-                    if not mid:
-                        continue
-                    if best is None or (end_ts and end_ts < best.get("end_ts",9999999999)):
-                        best = {"id": str(mid), "name": title,
+                    if not mid: continue
+                    if best_diff is None or diff < best_diff:
+                        best_diff = diff
+                        best = {"id": str(mid), "name": m.get("question","BTC 15m"),
                                 "end_ts": end_ts, "raw": m}
-                if best:
-                    logger.info("[Market] Markets API FOUND with: %s", params)
-                    break
             except Exception as e:
-                logger.warning("[Market] Markets API (params=%s): %s", params, e)
-
-    # Рівень 4: CLOB пагінований пошук
-    if not best:
-        try:
-            cursor = ""
-            for page in range(8):
-                params = {"next_cursor": cursor} if cursor else {}
-                r = requests.get("https://clob.polymarket.com/markets",
-                                 params=params, timeout=15)
-                if r.status_code != 200:
-                    break
-                data    = r.json()
-                markets = data.get("data", [])
-                cursor  = data.get("next_cursor", "")
-                for m in markets:
-                    if m.get("closed", True):
-                        continue
-                    title = m.get("question","") or m.get("market_slug","")
-                    if not _is_btc15m(title):
-                        continue
-                    tokens = m.get("tokens", [])
-                    if len(tokens) != 2:
-                        continue
-                    end_ts = _parse_end_ts(m)
-                    if not _is_valid_timing(end_ts, now):
-                        continue
-                    mid = m.get("condition_id") or m.get("id")
-                    if not mid:
-                        continue
-                    if best is None or (end_ts and end_ts < best.get("end_ts",9999999999)):
-                        best = {"id": str(mid), "name": title,
-                                "end_ts": end_ts, "raw": m}
-                if best or not cursor:
-                    break
-            logger.info("[Market] CLOB: %s", "FOUND" if best else "not found")
-        except Exception as e:
-            logger.warning("[Market] CLOB API: %s", e)
+                print(f"[Market] Relaxed fallback error: {e}")
 
     if not best:
-        logger.error("[Market] NOT FOUND after all 4 strategies")
+        print("[Market] NO ACTIVE BTC 15m MARKET FOUND")
         return None
 
+    # Витягуємо token_yes і token_no
     token_yes, token_no = _extract_tokens(best.get("raw",{}), best["id"])
 
-    end_ts  = best.get("end_ts", 0)
-    expires = (end_ts - 30) if end_ts > now else (now + 840)
-
+    # Кешуємо до кінця раунду (мінус 30с запасу)
+    expires = best["end_ts"] - 30
     _market_cache.update({
         "id":        best["id"],
         "name":      best["name"],
@@ -757,9 +744,9 @@ def _find_btc15m_market():
         "token_no":  token_no,
         "expires":   expires,
     })
-    logger.info("[Market] FOUND: %s [%s] expires in %.0fs",
-                best["name"][:60], best["id"][:20], expires - now)
+    print(f"[Market] FOUND: {best['name'][:60]} | id={best['id'][:20]} | diff={best_diff:.0f}s | expires in {expires-now_ts:.0f}s")
     return _market_cache
+
 
 def _prefetch_next_market():
     """Скидає кеш за 2 хв до завершення раунду — щоб наступний маркет знайшовся вчасно"""
@@ -1487,11 +1474,23 @@ async def handle_callback(u, c):
             await q.message.reply_text("❌ Підключіть гаманець: /wallet"); return
         if s.auto_active:
             s.auto_active = False
-            await q.message.reply_text("🔴 Авто вимкнено", reply_markup=main_keyboard(s))
+            print(f"[AUTO] uid={s.uid} AUTO OFF")
+            await q.message.reply_text("🔴 Авто-торгівля ВИМКНЕНА", reply_markup=main_keyboard(s))
         else:
+            s.auto_active = True
+            print(f"[AUTO] uid={s.uid} AUTO ON risk={s.risk_percent}%")
+            bal, _ = get_balance(s)
+            bet = s.calc_bet_size(bal) if bal else 0.0
             await q.message.reply_text(
-                "Введи % від балансу на угоду (1-20):\nПоточний: %.0f%%" % s.risk_percent)
-            c.user_data["auto_percent_pending"] = True
+                "🟢 Авто-торгівля УВІМКНЕНА\n\n"
+                "⚙️ Ризик: %.0f%% від балансу\n"
+                "🎯 Сума ставки: $%.2f\n"
+                "💰 Баланс: %s\n\n"
+                "Торгівля почнеться на наступному сигналі (:00 :15 :30 :45 UTC)\n"
+                "Змінити %: /setrisk" % (
+                    s.risk_percent, bet,
+                    "$%.2f"%bal if bal else "N/A"),
+                reply_markup=main_keyboard(s))
 
     elif q.data == "analyze_now":
         await q.message.reply_text("🔍 Аналіз...")
@@ -1596,6 +1595,7 @@ async def handle_message(u, c):
 # ============================================================
 async def execute_auto_trade(app, s: UserSession, payload, result):
     decision = result.get("decision"); strength = result.get("strength","LOW"); logic = result.get("logic","")
+    print(f"[AUTO TRADE] uid={s.uid} auto_active={s.auto_active} decision={decision} strength={strength}")
     if not decision: return
     strength_order = {"HIGH":3,"MEDIUM":2,"LOW":1}
     if strength_order.get(strength,1) < strength_order.get(AUTO_MIN_STRENGTH,2):
@@ -1687,7 +1687,9 @@ async def run_cycle_for_user(app, s: UserSession):
     ) % (dec_ua, str_ua, score, payload["price"]["current"], mkt_cond, ctx["session"],
          key_sig, logic, reas_s, risk_s)
 
+    print(f"[RUN_CYCLE] uid={s.uid} auto_active={s.auto_active} decision={decision} strength={strength}")
     if s.auto_active:
+        print(f"[RUN_CYCLE] Calling execute_auto_trade uid={s.uid}")
         await app.bot.send_message(chat_id=s.uid, text="🤖 АВТО-СИГНАЛ\n\n"+main_txt)
         await execute_auto_trade(app, s, payload, result)
     else:
