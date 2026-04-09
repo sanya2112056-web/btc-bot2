@@ -402,7 +402,7 @@ def init_poly_client(s):
         try:
             creds=client.derive_api_key()
         except Exception:
-            creds=client.create_or_derive_api_key()
+            creds=client.create_api_key()
         client.set_api_creds(creds)
         s.poly_client=client; s.poly_creds=creds; s.poly_ok=True
         print("[Poly] Client OK uid=%d addr=%s" % (s.uid,client.get_address()))
