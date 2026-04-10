@@ -417,151 +417,116 @@ def init_poly_client(s):
 # ============================================================
 def find_btc_market(verbose=False):
     """
-    Шукає активний BTC маркет через Gamma API.
-    Повертає dict з token_id_yes, token_id_no, condition_id, question.
-    ВАЖЛИВО: для торгівлі потрібен token_id, НЕ condition_id!
+    Знаходить активний BTC маркет через Gamma API.
+    Стратегія: closed=false + 2 токени + btc/bitcoin в назві.
+    Без фільтру по часу.
     """
-    now_ts=time.time(); best=None; best_diff=None
-    btc_kw=["btc","bitcoin"]
+    now_ts = time.time()
+    btc_kw = ["btc", "bitcoin"]
 
     for params in [
-        {"active":"true","closed":"false","limit":100},
-        {"closed":"false","limit":100},
-        {"active":"true","closed":"false","limit":100,"offset":100},
-        {"active":"true","limit":100},
+        {"active": "true", "closed": "false", "limit": 100},
+        {"closed": "false", "limit": 100},
+        {"active": "true", "closed": "false", "limit": 100, "offset": 100},
+        {"active": "true", "limit": 100},
     ]:
         try:
-            r=requests.get("https://gamma-api.polymarket.com/markets",params=params,timeout=15)
-            if r.status_code!=200:
-                if verbose: print("[Market] HTTP %d" % r.status_code)
+            r = requests.get(
+                "https://gamma-api.polymarket.com/markets",
+                params=params, timeout=15)
+            if r.status_code != 200:
+                print("[Market] HTTP %d params=%s" % (r.status_code, params))
                 continue
-            raw=r.json()
-            mlist=raw if isinstance(raw,list) else raw.get("markets",raw.get("data",[]))
-            if verbose: print("[Market] Got %d markets (params=%s)" % (len(mlist),params))
+            raw = r.json()
+            mlist = raw if isinstance(raw, list) else raw.get("markets", raw.get("data", []))
+            print("[Market] Got %d markets params=%s" % (len(mlist), params))
 
             for m in mlist:
-                if m.get("closed",True): continue
-                title=(m.get("question","") or m.get("title","")).lower()
-                if not any(k in title for k in btc_kw): continue
-                tokens=m.get("tokens") or m.get("outcomes") or []
-                if len(tokens)!=2: continue
+                # Фільтр 1: не закритий
+                if m.get("closed", True):
+                    continue
 
-                # Витягуємо token_id (ключова різниця від condition_id)
-                ty_id=tn_id=None; ty_pr=tn_pr=0.5
+                # Фільтр 2: BTC або Bitcoin в назві
+                title = (m.get("question", "") or m.get("title", "")).lower()
+                if not any(k in title for k in btc_kw):
+                    continue
+
+                # Фільтр 3: рівно 2 токени
+                tokens = m.get("tokens") or m.get("outcomes") or []
+                if len(tokens) != 2:
+                    continue
+
+                # Витягуємо token_id
+                ty_id = tn_id = None
+                ty_pr = tn_pr = 0.5
+
                 for t in tokens:
-                    oc=(t.get("outcome") or t.get("name") or "").upper().strip()
-                    tid=t.get("tokenId") or t.get("token_id") or t.get("id","")
-                    pr=float(t.get("price",0.5) or 0.5)
-                    if oc in ("YES","UP","HIGHER","ABOVE"): ty_id=tid; ty_pr=pr
-                    elif oc in ("NO","DOWN","LOWER","BELOW"): tn_id=tid; tn_pr=pr
-                if not ty_id and tokens:
-                    ty_id=tokens[0].get("tokenId") or tokens[0].get("token_id") or tokens[0].get("id","")
-                    ty_pr=float(tokens[0].get("price",0.5) or 0.5)
-                if not tn_id and len(tokens)>1:
-                    tn_id=tokens[1].get("tokenId") or tokens[1].get("token_id") or tokens[1].get("id","")
-                    tn_pr=float(tokens[1].get("price",0.5) or 0.5)
-                if not ty_id or not tn_id: continue
+                    oc  = (t.get("outcome") or t.get("name") or "").upper().strip()
+                    tid = (t.get("tokenId") or t.get("token_id") or
+                           t.get("id") or "").strip()
+                    pr  = float(t.get("price", 0.5) or 0.5)
+                    if oc in ("YES", "UP", "HIGHER", "ABOVE"):
+                        ty_id = tid; ty_pr = pr
+                    elif oc in ("NO", "DOWN", "LOWER", "BELOW"):
+                        tn_id = tid; tn_pr = pr
 
-                cid=(m.get("conditionId") or m.get("condition_id") or m.get("id","")).strip()
-                if not cid: continue
+                # Якщо не знайшли по назві — беремо перший/другий
+                if not ty_id and len(tokens) > 0:
+                    ty_id = (tokens[0].get("tokenId") or tokens[0].get("token_id") or
+                             tokens[0].get("id") or "").strip()
+                    ty_pr = float(tokens[0].get("price", 0.5) or 0.5)
+                if not tn_id and len(tokens) > 1:
+                    tn_id = (tokens[1].get("tokenId") or tokens[1].get("token_id") or
+                             tokens[1].get("id") or "").strip()
+                    tn_pr = float(tokens[1].get("price", 0.5) or 0.5)
+
+                if not ty_id or not tn_id:
+                    continue
+
+                cid = (m.get("conditionId") or m.get("condition_id") or
+                       m.get("id") or "").strip()
+                if not cid:
+                    continue
 
                 # Час до завершення
-                end_ts=None
-                for f in ("endDate","end_date_iso","endDateIso","end_time","endTime","enddate"):
-                    v=m.get(f)
+                end_ts = None
+                for f in ("endDate", "end_date_iso", "endDateIso",
+                          "end_time", "endTime", "enddate", "end_date"):
+                    v = m.get(f)
                     if v:
                         try:
-                            end_ts=float(datetime.datetime.fromisoformat(str(v).replace("Z","+00:00")).timestamp()); break
+                            end_ts = float(datetime.datetime.fromisoformat(
+                                str(v).replace("Z", "+00:00")).timestamp())
+                            break
                         except Exception:
-                            try: end_ts=float(v); break
+                            try: end_ts = float(v); break
                             except Exception: pass
-                diff=end_ts-now_ts if end_ts else None
 
-                candidate={
-                    "condition_id":cid,"token_id_yes":ty_id,"token_id_no":tn_id,
-                    "price_yes":ty_pr,"price_no":tn_pr,
-                    "question":m.get("question","") or m.get("title","BTC"),
-                    "diff_sec":diff,
+                diff = round(end_ts - now_ts, 0) if end_ts else None
+
+                q_text = m.get("question", "") or m.get("title", "BTC")
+                print("[Market] FOUND: %s" % q_text[:70])
+                print("[Market] condition_id : %s" % cid)
+                print("[Market] token_id_yes : %s" % ty_id)
+                print("[Market] token_id_no  : %s" % tn_id)
+                if diff: print("[Market] closes in: %.0f sec" % diff)
+
+                return {
+                    "condition_id": cid,
+                    "token_id_yes": ty_id,
+                    "token_id_no":  tn_id,
+                    "price_yes":    ty_pr,
+                    "price_no":     tn_pr,
+                    "question":     q_text,
+                    "diff_sec":     diff,
                 }
-                if verbose: print("[Market] Candidate: %s diff=%s" % (candidate["question"][:60],("%.0fs"%diff) if diff else "?"))
-
-                if diff is not None and diff>0:
-                    if best_diff is None or diff<best_diff:
-                        best_diff=diff; best=candidate
-                elif best is None:
-                    best=candidate
 
         except Exception as e:
-            print("[Market] Error: %s" % e)
-        if best and best_diff is not None and best_diff<900: break
+            print("[Market] Error params=%s: %s" % (params, e))
 
-    if best:
-        print("[Market] FOUND: %s" % best["question"][:70])
-        print("[Market] condition_id : %s" % best["condition_id"][:40])
-        print("[Market] token_id_yes : %s" % best["token_id_yes"][:40])
-        print("[Market] token_id_no  : %s" % best["token_id_no"][:40])
-        if best["diff_sec"]: print("[Market] Closes in   : %.0f sec" % best["diff_sec"])
-    else:
-        print("[Market] NOT FOUND")
-    return best
+    print("[Market] NOT FOUND after all attempts")
+    return None
 
-# ============================================================
-# PLACE BET
-# ============================================================
-def place_bet(s, direction: str, amount: float) -> dict:
-    """
-    direction: "UP" або "DOWN"
-    amount: сума в USDC
-    """
-    if not s.wallet_ok:
-        return {"success":False,"error":"Wallet not connected"}
-    if amount<1:
-        return {"success":False,"error":"Min bet $1"}
-    if not s.poly_ok:
-        ok,msg=init_poly_client(s)
-        if not ok: return {"success":False,"error":"Polymarket init failed: %s" % msg}
-
-    market=find_btc_market()
-    if not market: return {"success":False,"error":"No active BTC market found"}
-
-    if direction=="UP":
-        token_id=market["token_id_yes"]; price=market["price_yes"]
-    else:
-        token_id=market["token_id_no"]; price=market["price_no"]
-
-    # Оновлюємо ціну з CLOB
-    try:
-        fresh=float(s.poly_client.get_midpoint(token_id) or price)
-        if 0.01<=fresh<=0.99: price=fresh
-    except Exception: pass
-
-    price=max(0.01,min(0.99,price))
-    # size = кількість токенів = USDC / ціна
-    size=round(amount/price,2)
-    print("[BET] uid=%d dir=%s token=%s price=%.4f size=%.2f usdc=%.2f" % (
-        s.uid,direction,token_id[:20],price,size,amount))
-
-    try:
-        from py_clob_client.clob_types import OrderArgs, OrderType, Side
-        order=s.poly_client.create_order(OrderArgs(
-            token_id=token_id,price=price,size=size,side=Side.BUY))
-        resp=s.poly_client.post_order(order,OrderType.GTC)
-        print("[BET] OK: %s" % str(resp)[:80])
-        return {"success":True,"order":resp,"price":price,
-                "pot":round(size-amount,2),"market_name":market["question"][:60]}
-    except Exception as e:
-        err=str(e); print("[BET] FAIL uid=%d: %s" % (s.uid,err))
-        if "insufficient" in err.lower() or "balance" in err.lower():
-            return {"success":False,"error":"Insufficient USDC balance"}
-        if "allowance" in err.lower() or "approve" in err.lower():
-            return {"success":False,"error":"Need USDC approve. Use /approve"}
-        if "nonce" in err.lower():
-            return {"success":False,"error":"Nonce error, retry"}
-        return {"success":False,"error":err[:200]}
-
-# ============================================================
-# APPROVE USDC
-# ============================================================
 def approve_usdc(s):
     SPENDER="0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
     USDC   ="0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
@@ -891,6 +856,37 @@ async def cmd_dump(u,c):
             await u.message.reply_document(document=f,filename="signals_dump.json",
                 caption="Full dump %d bytes" % os.path.getsize(SIGNALS_DUMP))
     except Exception as e: await u.message.reply_text("Error: %s"%e)
+
+
+async def cmd_rawmarket(u, c):
+    """Діагностика: сирі дані з Polymarket API без фільтрів"""
+    await u.message.reply_text("Fetching raw Polymarket data...")
+    try:
+        results = []
+        for params in [
+            {"active": "true", "closed": "false", "limit": 20},
+            {"closed": "false", "limit": 20},
+        ]:
+            r = requests.get(
+                "https://gamma-api.polymarket.com/markets",
+                params=params, timeout=15)
+            raw  = r.json()
+            mlist = raw if isinstance(raw, list) else raw.get("markets", raw.get("data", []))
+            results.append("HTTP %d | params=%s | got %d markets" % (
+                r.status_code, params, len(mlist)))
+            for m in mlist[:5]:
+                title  = m.get("question", "") or m.get("title", "")
+                tokens = m.get("tokens") or m.get("outcomes") or []
+                cid    = m.get("conditionId") or m.get("id", "")
+                closed = m.get("closed", "?")
+                active = m.get("active", "?")
+                results.append(
+                    "• %s\n  tokens:%d closed:%s active:%s\n  id:%s" % (
+                        title[:55], len(tokens), closed, active, str(cid)[:25]))
+            results.append("")
+        await u.message.reply_text("\n".join(results)[:4000])
+    except Exception as e:
+        await u.message.reply_text("Error: %s" % e)
 
 async def cmd_status(u,c):
     s=get_session(u.effective_user.id)
@@ -1242,6 +1238,7 @@ def main():
     app.add_handler(CommandHandler("stats",      cmd_stats))
     app.add_handler(CommandHandler("errors",     cmd_errors))
     app.add_handler(CommandHandler("dump",       cmd_dump))
+    app.add_handler(CommandHandler("rawmarket",  cmd_rawmarket))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
