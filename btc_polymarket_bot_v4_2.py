@@ -417,193 +417,215 @@ def init_poly_client(s):
 # ============================================================
 def find_btc_market(verbose=False):
     """
-    Шукає "BTC Up or Down - 15 minutes" через CLOB API.
-    
-    CLOB API має endpoint /markets з пошуком по slug.
-    Серія називається btc-up-or-down-15-minutes-*
-    
-    Фільтр по часу: 0 < endDate - now < 1200 сек (поточний раунд).
-    """
-    now_ts = time.time()
-    print("[Market] Searching at %s UTC" %
-          datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S"))
+    Production-grade пошук "BTC Up or Down - 15 minutes".
 
-    def get_end_ts(m):
+    НЕ фільтрує по назві — назви в API ненадійні.
+    Єдиний надійний ідентифікатор = TIME WINDOW:
+        0 < (end_time - now) < 1200 секунд
+
+    Алгоритм:
+    1. Чекаємо 8 сек після старту раунду (маркет з'являється з затримкою)
+    2. Пагінуємо /markets до 20 сторінок
+    3. Фільтруємо локально: btc + 2 токени + time window
+    4. Retry до 7 разів з затримкою 3 сек якщо не знайшли
+    """
+    import time as _t
+
+    now_ts = _t.time()
+    utc_str = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S")
+    print("[Market] ===== START SEARCH at %s UTC =====" % utc_str)
+
+    # ── Парсимо end_time з будь-якого поля ──
+    def parse_end(m):
         for f in ("end_date_iso","endDate","endDateIso","end_time",
-                  "endTime","end_date","expirationTimestamp"):
+                  "endTime","end_date","expirationTimestamp","enddate"):
             v = m.get(f)
-            if v:
+            if not v:
+                continue
+            try:
+                return float(datetime.datetime.fromisoformat(
+                    str(v).replace("Z", "+00:00")).timestamp())
+            except Exception:
                 try:
-                    return float(datetime.datetime.fromisoformat(
-                        str(v).replace("Z","+00:00")).timestamp())
+                    return float(v)
                 except Exception:
-                    try: return float(v)
-                    except Exception: pass
+                    pass
         return None
 
-    def build_result(m):
-        tokens = m.get("tokens") or []
+    # ── Витягуємо token_id з токену ──
+    def get_tid(t):
+        return (t.get("token_id") or t.get("tokenId") or t.get("id") or "").strip()
+
+    # ── Будуємо результат з маркету ──
+    def build(m):
+        tokens = m.get("tokens") or m.get("outcomes") or []
         if len(tokens) != 2:
             return None
+
         ty_id = tn_id = ""
         ty_pr = tn_pr = 0.5
+
         for t in tokens:
-            oc  = (t.get("outcome") or "").upper().strip()
-            tid = (t.get("token_id") or t.get("tokenId") or t.get("id") or "").strip()
+            oc  = (t.get("outcome") or t.get("name") or "").upper().strip()
+            tid = get_tid(t)
             pr  = float(t.get("price", 0.5) or 0.5)
-            if oc in ("YES","UP","HIGHER","ABOVE"):
+            if oc in ("YES", "UP", "HIGHER", "ABOVE"):
                 ty_id = tid; ty_pr = pr
-            elif oc in ("NO","DOWN","LOWER","BELOW"):
+            elif oc in ("NO", "DOWN", "LOWER", "BELOW"):
                 tn_id = tid; tn_pr = pr
-        if not ty_id and tokens:
-            ty_id = (tokens[0].get("token_id") or tokens[0].get("tokenId") or tokens[0].get("id") or "").strip()
-            ty_pr = float(tokens[0].get("price",0.5) or 0.5)
-        if not tn_id and len(tokens)>1:
-            tn_id = (tokens[1].get("token_id") or tokens[1].get("tokenId") or tokens[1].get("id") or "").strip()
-            tn_pr = float(tokens[1].get("price",0.5) or 0.5)
+
+        # Якщо outcome не розпізнано — беремо позиційно
+        if not ty_id:
+            ty_id = get_tid(tokens[0]); ty_pr = float(tokens[0].get("price",0.5) or 0.5)
+        if not tn_id:
+            tn_id = get_tid(tokens[1]); tn_pr = float(tokens[1].get("price",0.5) or 0.5)
+
         if not ty_id or not tn_id:
             return None
-        cid = (m.get("condition_id") or m.get("conditionId") or m.get("id") or "").strip()
+
+        cid = (m.get("conditionId") or m.get("condition_id") or m.get("id") or "").strip()
         if not cid:
             return None
-        q      = m.get("question","") or "BTC Up or Down"
-        end_ts = get_end_ts(m)
-        diff   = round(end_ts - now_ts, 0) if end_ts else None
-        return {"condition_id":cid,"token_id_yes":ty_id,"token_id_no":tn_id,
-                "price_yes":ty_pr,"price_no":tn_pr,"question":q,
-                "diff_sec":diff,"end_ts":end_ts}
 
-    candidates = []
+        end_ts = parse_end(m)
+        diff   = round(end_ts - now_ts, 1) if end_ts else None
 
-    # ── Стратегія 1: CLOB /markets з пошуком по slug ──
-    # Серія має slug: btc-up-or-down-15-minutes-*
-    for slug_q in ["btc-up-or-down", "btc up or down", "bitcoin up or down"]:
-        try:
-            r = requests.get(
-                "https://clob.polymarket.com/markets",
-                params={"query": slug_q, "limit": 50},
-                timeout=20)
-            if r.status_code == 200:
-                data    = r.json()
-                markets = data if isinstance(data,list) else data.get("data",[])
-                print("[Market] CLOB search '%s': %d results" % (slug_q, len(markets)))
-                for m in markets:
-                    if m.get("closed",True):
-                        continue
-                    title = (m.get("question","") or "").lower()
-                    if "up or down" not in title and "higher" not in title:
-                        continue
-                    if "btc" not in title and "bitcoin" not in title:
-                        continue
-                    tokens = m.get("tokens",[])
-                    if len(tokens) != 2:
-                        continue
-                    res = build_result(m)
-                    if res:
-                        candidates.append(res)
-                if candidates:
-                    break
-        except Exception as e:
-            print("[Market] CLOB search error: %s" % e)
+        return {
+            "condition_id":  cid,
+            "token_id_yes":  ty_id,
+            "token_id_no":   tn_id,
+            "price_yes":     ty_pr,
+            "price_no":      tn_pr,
+            "question":      (m.get("question") or m.get("title") or "BTC"),
+            "diff_sec":      diff,
+            "end_ts":        end_ts,
+        }
 
-    # ── Стратегія 2: CLOB пагінація ──
-    if not candidates:
-        try:
+    # ── Одна спроба пошуку ──
+    def attempt(attempt_num):
+        snap_now = _t.time()
+        total_scanned = 0
+        btc_found     = 0
+        valid_time    = 0
+        best          = None
+
+        print("[Market] Attempt %d | scanning pages..." % attempt_num)
+
+        # Джерела: CLOB + Gamma
+        sources = [
+            ("CLOB",  "https://clob.polymarket.com/markets",  "clob"),
+            ("Gamma", "https://gamma-api.polymarket.com/markets", "gamma"),
+        ]
+
+        for src_name, base_url, src_type in sources:
             cursor = ""
             for page in range(20):
                 try:
-                    params = {"next_cursor": cursor} if cursor else {}
-                    r = requests.get("https://clob.polymarket.com/markets",
-                                     params=params, timeout=20)
+                    if src_type == "clob":
+                        params = {"next_cursor": cursor} if cursor else {}
+                    else:
+                        params = {"active":"true","closed":"false",
+                                  "limit":200,"offset":page*200}
+
+                    r = requests.get(base_url, params=params, timeout=25)
                     if r.status_code != 200:
+                        print("[Market] %s HTTP %d page %d" % (src_name, r.status_code, page))
                         break
-                    data    = r.json()
-                    markets = data.get("data",[])
-                    cursor  = data.get("next_cursor","")
-                    print("[Market] CLOB page %d: %d markets" % (page, len(markets)))
-                    for m in markets:
-                        if m.get("closed",True):
+
+                    data = r.json()
+                    if src_type == "clob":
+                        mlist  = data.get("data", [])
+                        cursor = data.get("next_cursor", "")
+                    else:
+                        mlist  = data if isinstance(data,list) else data.get("markets",data.get("data",[]))
+                        cursor = ""
+
+                    if not mlist:
+                        break
+
+                    total_scanned += len(mlist)
+
+                    for m in mlist:
+                        # Фільтр 1: не закритий
+                        if m.get("closed", True):
                             continue
-                        title = (m.get("question","") or "").lower()
-                        if "up or down" not in title and "higher" not in title:
-                            continue
+
+                        # Фільтр 2: BTC або Bitcoin в назві
+                        title = (m.get("question","") or m.get("title","")).lower()
                         if "btc" not in title and "bitcoin" not in title:
                             continue
-                        tokens = m.get("tokens",[])
+
+                        # Фільтр 3: рівно 2 токени з валідними ID
+                        tokens = m.get("tokens") or m.get("outcomes") or []
                         if len(tokens) != 2:
                             continue
-                        res = build_result(m)
-                        if res:
-                            candidates.append(res)
-                    if candidates or not cursor:
+                        if not get_tid(tokens[0]) or not get_tid(tokens[1]):
+                            continue
+
+                        # Фільтр 4: є end_time
+                        end_ts = parse_end(m)
+                        if end_ts is None:
+                            continue
+
+                        btc_found += 1
+                        diff = end_ts - snap_now
+
+                        # Фільтр 5: TIME WINDOW — єдиний надійний ідентифікатор
+                        if 0 < diff < 1200:
+                            valid_time += 1
+                            res = build(m)
+                            if res:
+                                # Беремо той що закривається найближче
+                                if best is None or diff < best["diff_sec"]:
+                                    best = res
+
+                    # Для Gamma — якщо менше 200 = остання сторінка
+                    if src_type == "gamma" and len(mlist) < 200:
                         break
+                    # Для CLOB — якщо немає cursor
+                    if src_type == "clob" and not cursor:
+                        break
+
                 except requests.exceptions.Timeout:
-                    print("[Market] CLOB page %d timeout, retrying..." % page)
-                    time.sleep(2)
-                    continue
-        except Exception as e:
-            print("[Market] CLOB pagination error: %s" % e)
-
-    # ── Стратегія 3: Gamma API з більшим timeout ──
-    if not candidates:
-        for params in [
-            {"active":"true","closed":"false","limit":200,"tag_slug":"crypto"},
-            {"active":"true","closed":"false","limit":200},
-        ]:
-            try:
-                r = requests.get(
-                    "https://gamma-api.polymarket.com/markets",
-                    params=params, timeout=30)
-                if r.status_code != 200:
-                    continue
-                raw   = r.json()
-                mlist = raw if isinstance(raw,list) else raw.get("markets",raw.get("data",[]))
-                print("[Market] Gamma: %d markets" % len(mlist))
-                for m in mlist:
-                    if m.get("closed",True):
-                        continue
-                    title = (m.get("question","") or m.get("title","")).lower()
-                    if "up or down" not in title and "higher" not in title:
-                        continue
-                    if "btc" not in title and "bitcoin" not in title:
-                        continue
-                    tokens = m.get("tokens") or m.get("outcomes") or []
-                    if len(tokens) != 2:
-                        continue
-                    res = build_result(m)
-                    if res:
-                        candidates.append(res)
-                if candidates:
+                    print("[Market] %s page %d TIMEOUT" % (src_name, page))
                     break
-            except Exception as e:
-                print("[Market] Gamma error: %s" % e)
+                except Exception as e:
+                    print("[Market] %s page %d error: %s" % (src_name, page, e))
+                    break
 
-    if not candidates:
-        print("[Market] NOT FOUND in all 3 strategies")
-        return None
+            if best:
+                break  # Знайшли — не треба пробувати інше джерело
 
-    print("[Market] Found %d candidates total" % len(candidates))
-    for c in candidates:
-        print("[Market]   %s | diff=%s" % (
-            c["question"][:55],
-            ("%.0f sec"%c["diff_sec"]) if c.get("diff_sec") else "no_time"))
+        print("[Market] Attempt %d | scanned=%d btc=%d valid_time=%d found=%s" % (
+            attempt_num, total_scanned, btc_found, valid_time,
+            best["question"][:40] if best else "NONE"))
+        return best
 
-    # Беремо той що закривається в межах 0-1200 сек (поточний раунд)
-    valid = [c for c in candidates
-             if c.get("diff_sec") is not None and 0 < c["diff_sec"] < 1200]
+    # ── ГОЛОВНИЙ ЦИКЛ: retry до 7 разів ──
+    MAX_RETRIES = 7
+    RETRY_DELAY = 3   # секунди між спробами
 
-    if valid:
-        best = min(valid, key=lambda c: c["diff_sec"])
-        print("[Market] CURRENT ROUND: %s | closes in %.0f sec" % (
-            best["question"][:55], best["diff_sec"]))
-    else:
-        # Немає з валідним часом — беремо перший (можливо endDate відсутній)
-        best = candidates[0]
-        print("[Market] No valid time filter — using first: %s" % best["question"][:55])
+    for attempt_num in range(1, MAX_RETRIES + 1):
+        result = attempt(attempt_num)
 
-    print("[Market] token_id_yes: %s" % best["token_id_yes"])
-    print("[Market] token_id_no:  %s" % best["token_id_no"])
-    return best
+        if result:
+            print("[Market] ===== FOUND =====")
+            print("[Market] Question   : %s" % result["question"][:70])
+            print("[Market] condition_id: %s" % result["condition_id"])
+            print("[Market] token_YES  : %s" % result["token_id_yes"])
+            print("[Market] token_NO   : %s" % result["token_id_no"])
+            print("[Market] price YES  : %.4f" % result["price_yes"])
+            print("[Market] price NO   : %.4f" % result["price_no"])
+            print("[Market] closes in  : %.0f sec" % result["diff_sec"])
+            return result
+
+        if attempt_num < MAX_RETRIES:
+            print("[Market] Not found, retry %d/%d in %ds..." % (
+                attempt_num, MAX_RETRIES, RETRY_DELAY))
+            _t.sleep(RETRY_DELAY)
+
+    print("[Market] ===== NOT FOUND after %d attempts =====" % MAX_RETRIES)
+    return None
 
 
 def approve_usdc(s):
@@ -1308,6 +1330,9 @@ async def periodic(app):
         wait=(next_run-now).total_seconds()
         logger.info("Next cycle in %.0fs at %s UTC",wait,next_run.strftime("%H:%M"))
         await asyncio.sleep(wait)
+        # Чекаємо 8 сек — маркет з'являється з затримкою після старту раунду
+        print("[Scheduler] Waiting 8s for market to appear...")
+        await asyncio.sleep(8)
         if _sessions:
             for uid,s in list(_sessions.items()):
                 try: await run_cycle(app,s)
