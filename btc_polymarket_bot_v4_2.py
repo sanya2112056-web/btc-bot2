@@ -555,19 +555,65 @@ def find_btc_market(verbose=False):
 
 def place_bet(s, direction: str, amount: float) -> dict:
     """
-    Розміщує ставку через прямі HTTP запити до Polymarket CLOB API.
-    Не потребує py-clob-client — тільки requests + eth-account + web3.
+    Ставка через py_clob_client якщо є, інакше через прямий підпис L1.
     """
     if not s.wallet_ok:
         return {"success": False, "error": "Wallet not connected"}
     if amount < 1:
         return {"success": False, "error": "Min $1"}
 
+    market = find_btc_market()
+    if not market:
+        return {"success": False, "error": "No active BTC market found"}
+
+    token_id = market["token_id_yes"] if direction == "UP" else market["token_id_no"]
+    price    = market["price_yes"]    if direction == "UP" else market["price_no"]
+    price    = max(0.01, min(0.99, float(price)))
+    size     = round(amount / price, 2)
+
+    print("[BET] dir=%s token=%s price=%.4f size=%.2f usdc=%.2f" % (
+        direction, token_id[:20], price, size, amount))
+
+    # ── Спроба 1: py-clob-client ──
+    try:
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import OrderArgs, OrderType, Side
+        from py_clob_client.constants import POLYGON
+
+        key = s.private_key.strip()
+        if not key.startswith("0x"): key = "0x" + key
+
+        client = ClobClient(
+            host="https://clob.polymarket.com",
+            key=key,
+            chain_id=POLYGON)
+        try:    creds = client.derive_api_key()
+        except: creds = client.create_api_key()
+        client.set_api_creds(creds)
+
+        try:
+            fresh = float(client.get_midpoint(token_id) or price)
+            if 0.01 <= fresh <= 0.99:
+                price = fresh
+                size  = round(amount / price, 2)
+        except Exception: pass
+
+        order = client.create_order(OrderArgs(
+            token_id=token_id, price=price, size=size, side=Side.BUY))
+        resp = client.post_order(order, OrderType.GTC)
+        print("[BET] py-clob OK: %s" % str(resp)[:100])
+        return {"success": True, "order": resp, "price": price,
+                "pot": round(size - amount, 2),
+                "market_name": market["question"][:60]}
+
+    except ImportError:
+        print("[BET] py-clob-client not installed, using L1 auth...")
+    except Exception as e:
+        print("[BET] py-clob error: %s — trying L1..." % str(e)[:100])
+
+    # ── Спроба 2: L1 автентифікація напряму ──
     try:
         import json as _json
-        import hmac
-        import hashlib
-        import base64
         from eth_account import Account
         from eth_account.messages import encode_defunct
 
@@ -576,130 +622,105 @@ def place_bet(s, direction: str, amount: float) -> dict:
         account = Account.from_key(key)
         address = account.address
 
-        # 1. Знаходимо маркет
-        market = find_btc_market()
-        if not market:
-            return {"success": False, "error": "No active BTC market found"}
+        # Polymarket L1 auth: підписуємо timestamp
+        ts  = str(int(time.time()))
+        msg = encode_defunct(text=ts)
+        sig = account.sign_message(msg).signature.hex()
+        if not sig.startswith("0x"): sig = "0x" + sig
 
-        token_id = market["token_id_yes"] if direction == "UP" else market["token_id_no"]
-        price    = market["price_yes"]    if direction == "UP" else market["price_no"]
-        price    = max(0.01, min(0.99, float(price)))
-        size     = round(amount / price, 2)
-
-        print("[BET] dir=%s token=%s price=%.4f size=%.2f" % (
-            direction, token_id[:20], price, size))
-
-        # 2. Отримуємо API credentials через підпис
-        # Polymarket використовує EIP-712 підпис для автентифікації
-        ts      = str(int(time.time()))
-        nonce   = "0"
-        method  = "GET"
-        path    = "/auth/api-key"
-        body    = ""
-
-        msg_to_sign = ts + method + path + body
-        msg = encode_defunct(text=msg_to_sign)
-        signed = account.sign_message(msg)
-        sig = signed.signature.hex()
-        if not sig.startswith("0x"):
-            sig = "0x" + sig
-
-        headers_auth = {
+        # Отримуємо або створюємо API key
+        headers = {
             "POLY_ADDRESS":   address,
             "POLY_SIGNATURE": sig,
             "POLY_TIMESTAMP": ts,
-            "POLY_NONCE":     nonce,
+            "POLY_NONCE":     "0",
             "Content-Type":   "application/json",
         }
 
-        r_key = requests.get(
-            "https://clob.polymarket.com/auth/api-key",
-            headers=headers_auth, timeout=15)
+        # Спочатку пробуємо GET (отримати існуючий ключ)
+        r = requests.get("https://clob.polymarket.com/auth/api-key",
+                         headers=headers, timeout=15)
+        print("[BET] GET api-key: HTTP %d body=%s" % (r.status_code, r.text[:80]))
 
-        print("[BET] Auth HTTP %d" % r_key.status_code)
+        if r.status_code == 200:
+            creds = r.json()
+        else:
+            # Якщо не існує — створюємо новий
+            r2 = requests.post("https://clob.polymarket.com/auth/api-key",
+                               headers=headers, timeout=15)
+            print("[BET] POST api-key: HTTP %d body=%s" % (r2.status_code, r2.text[:80]))
+            if r2.status_code not in (200, 201):
+                return {"success": False,
+                        "error": "Auth failed HTTP%d: %s" % (r2.status_code, r2.text[:100])}
+            creds = r2.json()
 
-        if r_key.status_code != 200:
-            return {"success": False, "error": "Auth failed: %s" % r_key.text[:100]}
+        api_key = creds.get("apiKey") or creds.get("api_key", "")
+        secret  = creds.get("secret", "")
+        passph  = creds.get("passphrase", "")
+        print("[BET] api_key=%s..." % api_key[:12])
 
-        creds   = r_key.json()
-        api_key = creds.get("apiKey") or creds.get("api_key","")
-        secret  = creds.get("secret","")
-        passph  = creds.get("passphrase","")
-
-        print("[BET] Got API key: %s..." % api_key[:10])
-
-        # 3. Отримуємо актуальну ціну
+        # Оновлюємо ціну
         try:
-            rp = requests.get(
-                "https://clob.polymarket.com/midpoints",
-                params={"token_id": token_id}, timeout=10)
+            rp = requests.get("https://clob.polymarket.com/midpoints",
+                              params={"token_id": token_id}, timeout=10)
             if rp.status_code == 200:
                 mid = float(rp.json().get("mid", price))
                 if 0.01 <= mid <= 0.99:
                     price = mid
                     size  = round(amount / price, 2)
-                    print("[BET] Fresh price: %.4f" % price)
         except Exception: pass
 
-        # 4. Підписуємо ордер через EIP-712
-        order_ts = str(int(time.time()))
-        order_body = _json.dumps({
+        # Будуємо і підписуємо ордер
+        import hmac as _hmac, hashlib, base64
+        order_ts   = str(int(time.time()))
+        order_data = _json.dumps({
             "order": {
-                "salt":       int(time.time() * 1000),
-                "maker":      address,
-                "signer":     address,
-                "taker":      "0x0000000000000000000000000000000000000000",
-                "tokenId":    token_id,
-                "makerAmount": str(int(amount * 1e6)),   # USDC 6 decimals
-                "takerAmount": str(int(size * 1e6)),
-                "expiration": "0",
-                "nonce":      "0",
-                "feeRateBps": "0",
-                "side":       "BUY",
+                "salt":          str(int(time.time() * 1000)),
+                "maker":         address,
+                "signer":        address,
+                "taker":         "0x0000000000000000000000000000000000000000",
+                "tokenId":       token_id,
+                "makerAmount":   str(int(amount * 1e6)),
+                "takerAmount":   str(int(size * 1e6)),
+                "expiration":    "0",
+                "nonce":         "0",
+                "feeRateBps":    "0",
+                "side":          "BUY",
                 "signatureType": 0,
+                "signature":     "0x",
             },
             "orderType": "GTC",
             "owner":     address,
-        }, separators=(',',':'))
+        }, separators=(',', ':'))
 
-        # HMAC підпис для API
-        sign_str = order_ts + "POST" + "/order" + order_body
-        h = hmac.new(secret.encode(), sign_str.encode(), hashlib.sha256)
+        sign_str = order_ts + "POST" + "/order" + order_data
+        h = _hmac.new(secret.encode(), sign_str.encode(), hashlib.sha256)
         api_sig = base64.b64encode(h.digest()).decode()
 
-        headers_order = {
-            "POLY-API-KEY":    api_key,
-            "POLY-SIGNATURE":  api_sig,
-            "POLY-TIMESTAMP":  order_ts,
-            "POLY-PASSPHRASE": passph,
-            "Content-Type":    "application/json",
-        }
-
-        ro = requests.post(
+        resp = requests.post(
             "https://clob.polymarket.com/order",
-            data=order_body,
-            headers=headers_order,
+            data=order_data,
+            headers={
+                "POLY-API-KEY":    api_key,
+                "POLY-SIGNATURE":  api_sig,
+                "POLY-TIMESTAMP":  order_ts,
+                "POLY-PASSPHRASE": passph,
+                "Content-Type":    "application/json",
+            },
             timeout=20)
 
-        print("[BET] Order HTTP %d: %s" % (ro.status_code, ro.text[:150]))
+        print("[BET] Order HTTP %d: %s" % (resp.status_code, resp.text[:150]))
 
-        if ro.status_code in (200, 201):
-            resp = ro.json()
-            return {
-                "success":     True,
-                "order":       resp,
-                "price":       price,
-                "pot":         round(size - amount, 2),
-                "market_name": market["question"][:60],
-            }
-        else:
-            return {"success": False, "error": "Order failed %d: %s" % (ro.status_code, ro.text[:150])}
+        if resp.status_code in (200, 201):
+            return {"success": True, "order": resp.json(), "price": price,
+                    "pot": round(size - amount, 2),
+                    "market_name": market["question"][:60]}
+        return {"success": False,
+                "error": "Order failed %d: %s" % (resp.status_code, resp.text[:150])}
 
-    except ImportError as e:
-        return {"success": False, "error": "Missing lib: %s" % str(e)}
     except Exception as e:
         err = str(e)
-        print("[BET] FAIL: %s" % err)
+        print("[BET] L1 error: %s" % err)
         if "insufficient" in err.lower():
             return {"success": False, "error": "Insufficient USDC balance"}
         if "allowance" in err.lower() or "approve" in err.lower():
