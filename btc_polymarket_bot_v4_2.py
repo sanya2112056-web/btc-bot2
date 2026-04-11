@@ -417,22 +417,13 @@ def init_poly_client(s):
 # ============================================================
 def find_btc_market(verbose=False):
     """
-    Знаходить "Bitcoin Up or Down - 15 min" / "BTC Up or Down - 15 Minutes".
-    Маркет знаходиться в Crypto -> 15 Min на Polymarket.
+    Знаходить ПОТОЧНИЙ активний раунд "Bitcoin Up or Down - 15 min".
 
-    Стратегія:
-    1. Gamma API з tag_slug=crypto  (точно повертає крипто маркети)
-    2. Gamma API без фільтру        (резерв)
-    3. CLOB API пагінація           (останній резерв)
+    Правильний endpoint: gamma-api.polymarket.com/markets
+    Параметр що повертає ТІЛЬКИ активні маркети: active=true&closed=false
 
-    Фільтри локально:
-    - "up or down" в назві + ("btc" або "bitcoin")
-    - closed = false
-    - є 2 токени з валідними token_id
-    - diff > 0 (маркет ще не закрився)
-
-    Беремо маркет з НАЙМЕНШИМ diff = поточний раунд.
-    Retry 7 разів по 3 сек.
+    Маркет завжди є. Він оновлюється кожні 15 хв.
+    Після сигналу — шукаємо і ставимо одразу.
     """
     import time as _t
 
@@ -452,17 +443,13 @@ def find_btc_market(verbose=False):
     def get_tid(t):
         return (t.get("token_id") or t.get("tokenId") or t.get("id") or "").strip()
 
-    def is_target(title):
-        t = title.lower()
-        has_btc = "btc" in t or "bitcoin" in t
-        has_updown = "up or down" in t or "up-or-down" in t
-        return has_btc and has_updown
-
     def build(m, now_ts):
         tokens = m.get("tokens") or m.get("outcomes") or []
         if len(tokens) != 2: return None
+
         ty_id = tn_id = ""
         ty_pr = tn_pr = 0.5
+
         for t in tokens:
             oc  = (t.get("outcome") or t.get("name") or "").upper().strip()
             tid = get_tid(t)
@@ -471,138 +458,106 @@ def find_btc_market(verbose=False):
                 ty_id = tid; ty_pr = pr
             elif oc in ("NO","DOWN","LOWER","BELOW"):
                 tn_id = tid; tn_pr = pr
-        if not ty_id and tokens:
-            ty_id = get_tid(tokens[0]); ty_pr = float(tokens[0].get("price",0.5) or 0.5)
-        if not tn_id and len(tokens)>1:
-            tn_id = get_tid(tokens[1]); tn_pr = float(tokens[1].get("price",0.5) or 0.5)
+
+        # Якщо outcome не розпізнано — беремо позиційно
+        if not ty_id:
+            ty_id = get_tid(tokens[0])
+            ty_pr = float(tokens[0].get("price", 0.5) or 0.5)
+        if not tn_id:
+            tn_id = get_tid(tokens[1])
+            tn_pr = float(tokens[1].get("price", 0.5) or 0.5)
+
         if not ty_id or not tn_id: return None
+
         cid = (m.get("conditionId") or m.get("condition_id") or m.get("id") or "").strip()
         if not cid: return None
+
         end_ts = parse_end(m)
-        if end_ts is None: return None
+        if not end_ts: return None
+
         diff = end_ts - now_ts
-        if diff <= 0: return None   # вже закрився
+        if diff <= 0: return None  # вже закрився
+
         q = m.get("question","") or m.get("title","BTC")
-        return {"condition_id":cid,"token_id_yes":ty_id,"token_id_no":tn_id,
-                "price_yes":ty_pr,"price_no":tn_pr,"question":q,"diff_sec":round(diff,1)}
+        return {
+            "condition_id":  cid,
+            "token_id_yes":  ty_id,
+            "token_id_no":   tn_id,
+            "price_yes":     ty_pr,
+            "price_no":      tn_pr,
+            "question":      q,
+            "diff_sec":      round(diff, 1),
+        }
 
-    def scan_once(attempt_num):
-        now_ts = _t.time()
+    def is_btc_updown(title):
+        t = title.lower()
+        is_btc = "btc" in t or "bitcoin" in t
+        is_ud  = "up or down" in t or "up-or-down" in t
+        return is_btc and is_ud
+
+    def scan():
+        now_ts     = _t.time()
         candidates = []
-        total = 0
+        total      = 0
 
-        print("[Market] Attempt %d | %s UTC" % (
-            attempt_num,
-            datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S")))
-
-        # ── Джерело 1: Gamma з tag_slug=crypto (найточніше для крипто маркетів) ──
+        # Правильний запит: active=true + closed=false = тільки поточні маркети
+        # Gamma API сортує по даті створення — нові маркети на початку
         for params in [
-            {"active":"true","closed":"false","tag_slug":"crypto","limit":200},
-            {"active":"true","closed":"false","tag_slug":"crypto","limit":200,"offset":200},
+            {"active": "true", "closed": "false", "limit": 100},
+            {"active": "true", "closed": "false", "limit": 100, "offset": 100},
+            {"active": "true", "closed": "false", "limit": 100, "offset": 200},
         ]:
             try:
-                r = requests.get("https://gamma-api.polymarket.com/markets",
-                                 params=params, timeout=30)
+                r = requests.get(
+                    "https://gamma-api.polymarket.com/markets",
+                    params=params, timeout=30)
+
                 if r.status_code != 200:
-                    print("[Market] Gamma HTTP %d" % r.status_code)
+                    print("[Market] HTTP %d" % r.status_code)
                     continue
+
                 raw   = r.json()
-                mlist = raw if isinstance(raw,list) else raw.get("markets",raw.get("data",[]))
+                mlist = raw if isinstance(raw, list) else raw.get("markets", raw.get("data", []))
                 total += len(mlist)
-                print("[Market] Gamma crypto: %d markets" % len(mlist))
+
                 for m in mlist:
-                    if m.get("closed",True): continue
+                    if m.get("closed", True): continue
+
                     title = m.get("question","") or m.get("title","")
-                    if not is_target(title): continue
+                    if not is_btc_updown(title): continue
+
                     res = build(m, now_ts)
                     if res:
-                        print("[Market] Candidate: %s | diff=%.0fs" % (title[:60], res["diff_sec"]))
+                        print("[Market] CANDIDATE: %s | diff=%.0fs" % (title[:60], res["diff_sec"]))
                         candidates.append(res)
+
             except Exception as e:
-                print("[Market] Gamma crypto error: %s" % e)
+                print("[Market] Gamma error: %s" % e)
 
-        # ── Джерело 2: Gamma без фільтру (якщо crypto tag не допоміг) ──
-        if not candidates:
-            for params in [
-                {"active":"true","closed":"false","limit":200},
-                {"active":"true","closed":"false","limit":200,"offset":200},
-                {"active":"true","closed":"false","limit":200,"offset":400},
-            ]:
-                try:
-                    r = requests.get("https://gamma-api.polymarket.com/markets",
-                                     params=params, timeout=30)
-                    if r.status_code != 200: continue
-                    raw   = r.json()
-                    mlist = raw if isinstance(raw,list) else raw.get("markets",raw.get("data",[]))
-                    total += len(mlist)
-                    print("[Market] Gamma all: %d markets (offset=%s)" % (
-                        len(mlist), params.get("offset",0)))
-                    for m in mlist:
-                        if m.get("closed",True): continue
-                        title = m.get("question","") or m.get("title","")
-                        if not is_target(title): continue
-                        res = build(m, now_ts)
-                        if res:
-                            print("[Market] Candidate: %s | diff=%.0fs" % (title[:60], res["diff_sec"]))
-                            candidates.append(res)
-                    if candidates: break
-                except Exception as e:
-                    print("[Market] Gamma all error: %s" % e)
-
-        # ── Джерело 3: CLOB пагінація ──
-        if not candidates:
-            try:
-                cursor = ""
-                for page in range(15):
-                    try:
-                        params = {"next_cursor": cursor} if cursor else {}
-                        r = requests.get("https://clob.polymarket.com/markets",
-                                         params=params, timeout=25)
-                        if r.status_code != 200: break
-                        data   = r.json()
-                        mlist  = data.get("data",[])
-                        cursor = data.get("next_cursor","")
-                        total += len(mlist)
-                        for m in mlist:
-                            if m.get("closed",True): continue
-                            title = m.get("question","") or ""
-                            if not is_target(title): continue
-                            res = build(m, now_ts)
-                            if res:
-                                print("[Market] CLOB candidate: %s | diff=%.0fs" % (
-                                    title[:60], res["diff_sec"]))
-                                candidates.append(res)
-                        if candidates or not cursor: break
-                    except requests.exceptions.Timeout:
-                        print("[Market] CLOB page %d timeout" % page)
-                        break
-                    except Exception as e:
-                        print("[Market] CLOB page %d: %s" % (page, e))
-                        break
-            except Exception as e:
-                print("[Market] CLOB error: %s" % e)
-
-        print("[Market] total scanned=%d candidates=%d" % (total, len(candidates)))
+        print("[Market] scanned=%d candidates=%d" % (total, len(candidates)))
 
         if not candidates:
             return None
 
         # Беремо з найменшим diff = поточний раунд
         best = min(candidates, key=lambda c: c["diff_sec"])
-        print("[MARKET] FOUND: %s" % best["question"][:70])
+        print("[MARKET] USING: %s" % best["question"][:70])
         print("[MARKET] ID=%s" % best["condition_id"])
         print("[TOKENS] YES=%s" % best["token_id_yes"])
         print("[TOKENS] NO =%s" % best["token_id_no"])
         print("[MARKET] closes in %.0f sec" % best["diff_sec"])
         return best
 
-    # ── Retry loop ──
+    # Retry 7 разів по 3 сек
     for attempt in range(1, 8):
-        result = scan_once(attempt)
+        print("[Market] Attempt %d/7 at %s UTC" % (
+            attempt,
+            datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S")))
+        result = scan()
         if result:
             return result
         if attempt < 7:
-            print("[Market] Not found, retry %d/7 in 3s..." % attempt)
+            print("[Market] Not found, retry in 3s...")
             _t.sleep(3)
 
     print("[Market] NOT FOUND after 7 attempts")
@@ -610,7 +565,6 @@ def find_btc_market(verbose=False):
 
 
 def place_bet(s, direction: str, amount: float) -> dict:
-    """Розміщує ставку. direction=UP або DOWN. amount=USDC."""
     if not s.wallet_ok:
         return {"success":False,"error":"Wallet not connected"}
     if amount < 1:
@@ -626,25 +580,19 @@ def place_bet(s, direction: str, amount: float) -> dict:
         except: creds = client.create_api_key()
         client.set_api_creds(creds)
         s.poly_client = client; s.poly_ok = True
-
         market = find_btc_market()
         if not market:
             return {"success":False,"error":"No active BTC Up or Down market found"}
-
         token_id = market["token_id_yes"] if direction=="UP" else market["token_id_no"]
         price    = market["price_yes"]    if direction=="UP" else market["price_no"]
-
         try:
             fresh = float(client.get_midpoint(token_id) or price)
             if 0.01 <= fresh <= 0.99: price = fresh
-        except Exception as e:
-            print("[BET] Midpoint error: %s" % e)
-
+        except Exception: pass
         price = max(0.01, min(0.99, price))
         size  = round(amount / price, 2)
         print("[BET] dir=%s token=%s price=%.4f size=%.2f usdc=%.2f" % (
             direction, token_id[:20], price, size, amount))
-
         order = client.create_order(OrderArgs(
             token_id=token_id, price=price, size=size, side=Side.BUY))
         resp = client.post_order(order, OrderType.GTC)
@@ -655,14 +603,12 @@ def place_bet(s, direction: str, amount: float) -> dict:
         return {"success":False,"error":"pip install py-clob-client"}
     except Exception as e:
         err = str(e); print("[BET] FAIL: %s" % err)
-        if "insufficient" in err.lower() or "balance" in err.lower():
-            return {"success":False,"error":"Insufficient USDC balance"}
+        if "insufficient" in err.lower(): return {"success":False,"error":"Insufficient USDC"}
         if "allowance" in err.lower() or "approve" in err.lower():
             return {"success":False,"error":"Need approve. Press Approve button"}
-        if "nonce" in err.lower():
-            return {"success":False,"error":"Nonce error, retry"}
+        if "nonce" in err.lower(): return {"success":False,"error":"Nonce error, retry"}
         if "401" in err or "unauthorized" in err.lower():
-            return {"success":False,"error":"API auth error. Reconnect wallet"}
+            return {"success":False,"error":"Auth error. Reconnect wallet"}
         return {"success":False,"error":err[:200]}
 
 
@@ -998,44 +944,71 @@ async def cmd_dump(u,c):
 
 
 async def cmd_rawmarket(u, c):
-    """Діагностика Polymarket API"""
-    await u.message.reply_text("Testing Polymarket APIs...")
+    """Показує що реально є в Gamma API прямо зараз"""
+    await u.message.reply_text("Fetching active markets from Gamma API...")
     lines = []
-
-    # Тест 1: CLOB search
     try:
-        r = requests.get("https://clob.polymarket.com/markets",
-                         params={"query":"btc-up-or-down","limit":10}, timeout=20)
-        raw = r.json()
-        mlist = raw if isinstance(raw,list) else raw.get("data",[])
-        lines.append("CLOB search 'btc-up-or-down': HTTP %d | %d results" % (r.status_code, len(mlist)))
-        for m in mlist[:5]:
-            q = m.get("question","")[:55]
-            tokens = m.get("tokens",[])
-            closed = m.get("closed","?")
-            lines.append("  • %s | tokens:%d closed:%s" % (q,len(tokens),closed))
+        import time as _t
+        now = _t.time()
+        r = requests.get(
+            "https://gamma-api.polymarket.com/markets",
+            params={"active":"true","closed":"false","limit":100},
+            timeout=30)
+        raw   = r.json()
+        mlist = raw if isinstance(raw,list) else raw.get("markets",raw.get("data",[]))
+        lines.append("Gamma API: HTTP %d | %d active markets" % (r.status_code, len(mlist)))
+        lines.append("")
+
+        btc_all = []
+        btc_updown = []
+        for m in mlist:
+            if m.get("closed",True): continue
+            title = m.get("question","") or m.get("title","")
+            t = title.lower()
+            if "btc" in t or "bitcoin" in t:
+                btc_all.append(title)
+            if ("btc" in t or "bitcoin" in t) and ("up or down" in t):
+                btc_updown.append((title, m))
+
+        lines.append("BTC markets total: %d" % len(btc_all))
+        lines.append("BTC Up or Down: %d" % len(btc_updown))
+        lines.append("")
+
+        if btc_updown:
+            lines.append("=== BTC UP OR DOWN MARKETS ===")
+            for title, m in btc_updown:
+                tokens = m.get("tokens") or []
+                # Парсимо endDate
+                end_ts = None
+                for f in ("endDate","end_date_iso","endDateIso","end_time","endTime"):
+                    v = m.get(f)
+                    if v:
+                        try:
+                            import datetime as _dt
+                            end_ts = float(_dt.datetime.fromisoformat(
+                                str(v).replace("Z","+00:00")).timestamp())
+                            break
+                        except Exception: pass
+                diff = round(end_ts - now) if end_ts else None
+                lines.append("Name: %s" % title[:70])
+                lines.append("Tokens: %d | diff: %s sec" % (
+                    len(tokens), ("%.0f"%diff) if diff else "unknown"))
+                if tokens:
+                    for t2 in tokens:
+                        oc = t2.get("outcome","?")
+                        tid = t2.get("tokenId") or t2.get("token_id") or t2.get("id","?")
+                        pr  = t2.get("price","?")
+                        lines.append("  %s: tid=%s price=%s" % (oc, str(tid)[:25], pr))
+                lines.append("")
+        else:
+            lines.append("NO BTC UP OR DOWN MARKETS FOUND")
+            lines.append("")
+            lines.append("All BTC markets:")
+            for t in btc_all[:10]:
+                lines.append("  • %s" % t[:60])
+
     except Exception as e:
-        lines.append("CLOB error: %s" % str(e)[:80])
-
-    lines.append("")
-
-    # Тест 2: CLOB перша сторінка
-    try:
-        r2 = requests.get("https://clob.polymarket.com/markets", timeout=20)
-        data = r2.json()
-        mlist2 = data.get("data",[])
-        btc = [m for m in mlist2
-               if "btc" in (m.get("question","")).lower()
-               or "bitcoin" in (m.get("question","")).lower()]
-        lines.append("CLOB page 1: %d markets | BTC: %d" % (len(mlist2), len(btc)))
-        for m in btc[:5]:
-            lines.append("  • %s | tokens:%d" % (m.get("question","")[:55], len(m.get("tokens",[]))))
-    except Exception as e:
-        lines.append("CLOB page1 error: %s" % str(e)[:80])
-
-    lines.append("")
-    lines.append("If BTC Up or Down appears above — /testmarket should work.")
-    lines.append("Market appears at :00 :15 :30 :45 UTC")
+        lines.append("Error: %s" % str(e)[:200])
 
     await u.message.reply_text("\n".join(lines)[:4000])
 
