@@ -417,22 +417,48 @@ def init_poly_client(s):
 # ============================================================
 def find_btc_market(verbose=False):
     """
-    Знаходить "BTC Up or Down - 15 min" через slug: btc-updown-15m-{timestamp}
-
-    Timestamp раунду = Unix час початку раунду (кратний 900 сек = 15 хв).
-    Наприклад: 1775901600 = початок раунду о певній UTC годині.
-
-    Стратегія:
-    1. Рахуємо timestamp поточного і наступного раунду
-    2. Пробуємо GET /events?slug=btc-updown-15m-{ts}
-    3. Якщо не знайдено — пробуємо сусідні timestamp
-    4. Retry 7 разів
+    Знаходить "Bitcoin Up or Down - 15 min" через slug btc-updown-15m-{timestamp}.
+    Токени беремо через CLOB API по condition_id.
     """
     import time as _t
     import math
 
     SLUG_PREFIX = "btc-updown-15m-"
     ROUND_SEC   = 900  # 15 хвилин
+
+    def get_tokens_from_clob(condition_id):
+        """Отримує token_id YES/NO через CLOB по condition_id"""
+        try:
+            r = requests.get(
+                "https://clob.polymarket.com/markets/%s" % condition_id,
+                timeout=15)
+            if r.status_code != 200:
+                print("[CLOB] HTTP %d for %s" % (r.status_code, condition_id[:20]))
+                return None, None, 0.5, 0.5
+            m = r.json()
+            tokens = m.get("tokens", [])
+            print("[CLOB] Got %d tokens for %s" % (len(tokens), condition_id[:20]))
+            ty_id = tn_id = ""
+            ty_pr = tn_pr = 0.5
+            for t in tokens:
+                oc  = (t.get("outcome") or "").upper().strip()
+                tid = (t.get("token_id") or t.get("tokenId") or t.get("id") or "").strip()
+                pr  = float(t.get("price", 0.5) or 0.5)
+                if oc in ("YES","UP","HIGHER","ABOVE"):
+                    ty_id = tid; ty_pr = pr
+                elif oc in ("NO","DOWN","LOWER","BELOW"):
+                    tn_id = tid; tn_pr = pr
+            # Якщо outcome не розпізнано — беремо позиційно
+            if not ty_id and len(tokens) > 0:
+                ty_id = (tokens[0].get("token_id") or tokens[0].get("tokenId") or "").strip()
+                ty_pr = float(tokens[0].get("price", 0.5) or 0.5)
+            if not tn_id and len(tokens) > 1:
+                tn_id = (tokens[1].get("token_id") or tokens[1].get("tokenId") or "").strip()
+                tn_pr = float(tokens[1].get("price", 0.5) or 0.5)
+            return ty_id, tn_id, ty_pr, tn_pr
+        except Exception as e:
+            print("[CLOB] Token fetch error: %s" % e)
+            return None, None, 0.5, 0.5
 
     def parse_end(m):
         for f in ("end_date_iso","endDate","endDateIso","end_time",
@@ -447,137 +473,84 @@ def find_btc_market(verbose=False):
                 except Exception: pass
         return None
 
-    def get_tid(t):
-        return (t.get("token_id") or t.get("tokenId") or t.get("id") or "").strip()
-
-    def build_from_event(ev, now_ts):
-        """Витягує активний маркет з event"""
-        markets = ev.get("markets", [])
-        candidates = []
-        for m in markets:
-            if m.get("closed", True):
-                continue
-            tokens = m.get("tokens") or m.get("outcomes") or []
-            if len(tokens) != 2:
-                continue
-
-            ty_id = tn_id = ""
-            ty_pr = tn_pr = 0.5
-            for t in tokens:
-                oc  = (t.get("outcome") or t.get("name") or "").upper().strip()
-                tid = get_tid(t)
-                pr  = float(t.get("price", 0.5) or 0.5)
-                if oc in ("YES","UP","HIGHER","ABOVE"):
-                    ty_id = tid; ty_pr = pr
-                elif oc in ("NO","DOWN","LOWER","BELOW"):
-                    tn_id = tid; tn_pr = pr
-            if not ty_id and tokens:
-                ty_id = get_tid(tokens[0])
-                ty_pr = float(tokens[0].get("price",0.5) or 0.5)
-            if not tn_id and len(tokens)>1:
-                tn_id = get_tid(tokens[1])
-                tn_pr = float(tokens[1].get("price",0.5) or 0.5)
-            if not ty_id or not tn_id:
-                continue
-
-            cid = (m.get("conditionId") or m.get("condition_id") or m.get("id") or "").strip()
-            if not cid:
-                continue
-
-            end_ts = parse_end(m)
-            diff   = (end_ts - now_ts) if end_ts else None
-
-            q = m.get("question","") or ev.get("title","BTC")
-            candidates.append({
-                "condition_id":  cid,
-                "token_id_yes":  ty_id,
-                "token_id_no":   tn_id,
-                "price_yes":     ty_pr,
-                "price_no":      tn_pr,
-                "question":      q,
-                "diff_sec":      round(diff, 1) if diff else 999,
-            })
-
-        if not candidates:
-            return None
-        # Беремо з найменшим diff > 0
-        valid = [c for c in candidates if c["diff_sec"] > 0]
-        if valid:
-            return min(valid, key=lambda c: c["diff_sec"])
-        return candidates[0]
-
     def try_slug(slug, now_ts):
-        """Пробує знайти event по slug"""
         try:
             r = requests.get(
                 "https://gamma-api.polymarket.com/events",
-                params={"slug": slug},
-                timeout=15)
-            print("[Market] slug=%s HTTP=%d" % (slug, r.status_code))
+                params={"slug": slug}, timeout=15)
             if r.status_code != 200:
                 return None
-            raw = r.json()
-            events = raw if isinstance(raw, list) else [raw] if isinstance(raw, dict) and raw else []
+            raw    = r.json()
+            events = raw if isinstance(raw, list) else [raw] if (isinstance(raw, dict) and raw) else []
             if not events:
                 return None
-            ev = events[0] if isinstance(events, list) else events
+            ev = events[0]
             if not ev:
                 return None
-            print("[Market] Event found: %s" % (ev.get("title","") or ev.get("slug","")))
-            return build_from_event(ev, now_ts)
+
+            title = ev.get("title","") or ev.get("slug","")
+            print("[Market] Event: %s" % title[:60])
+
+            markets = ev.get("markets", [])
+            for m in markets:
+                if m.get("closed", True):
+                    continue
+
+                # Беремо condition_id
+                cid = (m.get("conditionId") or m.get("condition_id") or m.get("id") or "").strip()
+                if not cid:
+                    continue
+
+                # Час закриття
+                end_ts = parse_end(m)
+                diff   = (end_ts - now_ts) if end_ts else 900.0
+                if diff <= 0:
+                    continue
+
+                q = m.get("question","") or title
+
+                # Токени через CLOB (бо в Gamma вони порожні)
+                ty_id, tn_id, ty_pr, tn_pr = get_tokens_from_clob(cid)
+
+                if not ty_id or not tn_id:
+                    print("[Market] No tokens for cid=%s" % cid[:20])
+                    continue
+
+                print("[MARKET] FOUND: %s" % q[:60])
+                print("[MARKET] condition_id=%s" % cid)
+                print("[TOKENS] YES=%s price=%.4f" % (ty_id[:25], ty_pr))
+                print("[TOKENS] NO =%s price=%.4f" % (tn_id[:25], tn_pr))
+                print("[MARKET] closes in %.0f sec" % diff)
+
+                return {
+                    "condition_id":  cid,
+                    "token_id_yes":  ty_id,
+                    "token_id_no":   tn_id,
+                    "price_yes":     ty_pr,
+                    "price_no":      tn_pr,
+                    "question":      q,
+                    "diff_sec":      round(diff, 1),
+                }
         except Exception as e:
-            print("[Market] slug error: %s" % e)
-            return None
+            print("[Market] try_slug error: %s" % e)
+        return None
 
     def scan():
         now_ts = _t.time()
-
-        # Рахуємо timestamp поточного раунду (кратний 900)
-        current_round = int(now_ts // ROUND_SEC) * ROUND_SEC
-        # Перевіряємо поточний і сусідні раунди (±1)
-        timestamps = [
-            current_round,
-            current_round - ROUND_SEC,  # попередній раунд
-            current_round + ROUND_SEC,  # наступний раунд
-        ]
-
-        print("[Market] now=%.0f current_round=%d" % (now_ts, current_round))
+        # Timestamp поточного раунду (кратний 900)
+        current = int(now_ts // ROUND_SEC) * ROUND_SEC
+        # Пробуємо поточний, наступний і попередній раунд
+        timestamps = [current, current + ROUND_SEC, current - ROUND_SEC]
+        print("[Market] now=%.0f current_round=%d" % (now_ts, current))
 
         for ts in timestamps:
-            slug = "%s%d" % (SLUG_PREFIX, ts)
+            slug   = "%s%d" % (SLUG_PREFIX, ts)
+            print("[Market] Trying slug: %s" % slug)
             result = try_slug(slug, now_ts)
             if result:
-                print("[MARKET] FOUND via slug: %s" % slug)
-                print("[MARKET] Q=%s" % result["question"][:60])
-                print("[TOKENS] YES=%s" % result["token_id_yes"])
-                print("[TOKENS] NO =%s" % result["token_id_no"])
-                print("[MARKET] diff=%.0f sec" % result["diff_sec"])
                 return result
 
-        print("[Market] Slug search failed, trying broader search...")
-
-        # Fallback: шукаємо через /events з фільтром по title
-        try:
-            r = requests.get(
-                "https://gamma-api.polymarket.com/events",
-                params={"active":"true","closed":"false","limit":200},
-                timeout=30)
-            if r.status_code == 200:
-                raw    = r.json()
-                events = raw if isinstance(raw, list) else raw.get("events", raw.get("data", []))
-                print("[Market] Fallback: %d events" % len(events))
-                for ev in events:
-                    slug_ev = ev.get("slug","")
-                    title   = (ev.get("title","") or ev.get("name","")).lower()
-                    # Перевіряємо slug або назву
-                    if SLUG_PREFIX.rstrip("-") in slug_ev or                        ("bitcoin" in title and "up" in title and "down" in title) or                        ("btc" in title and "up" in title and "down" in title):
-                        print("[Market] Fallback match: slug=%s title=%s" % (slug_ev, title[:50]))
-                        result = build_from_event(ev, now_ts)
-                        if result:
-                            return result
-        except Exception as e:
-            print("[Market] Fallback error: %s" % e)
-
+        print("[Market] All slugs failed")
         return None
 
     # Retry 7 разів по 3 сек
@@ -976,46 +949,54 @@ async def cmd_dump(u,c):
 
 
 async def cmd_rawmarket(u, c):
-    """Діагностика: перевіряє slug btc-updown-15m"""
-    await u.message.reply_text("Checking btc-updown-15m slugs...")
+    """Діагностика: перевіряє slug + CLOB токени"""
     import time as _t
     now    = _t.time()
-    prefix = "btc-updown-15m-"
     ROUND  = 900
-    lines  = []
-
+    prefix = "btc-updown-15m-"
     current = int(now // ROUND) * ROUND
-    timestamps = [current - ROUND, current, current + ROUND, current + ROUND*2]
+    lines   = []
 
-    for ts in timestamps:
+    for ts in [current - ROUND, current, current + ROUND]:
         slug = "%s%d" % (prefix, ts)
         try:
             r = requests.get(
                 "https://gamma-api.polymarket.com/events",
                 params={"slug": slug}, timeout=15)
-            raw = r.json()
+            raw    = r.json()
             events = raw if isinstance(raw,list) else [raw] if isinstance(raw,dict) and raw else []
-            if events and events[0]:
-                ev     = events[0]
-                title  = ev.get("title","") or ev.get("slug","")
-                mkts   = ev.get("markets",[])
-                active = [m for m in mkts if not m.get("closed",True)]
-                lines.append("FOUND: %s" % slug)
-                lines.append("Title: %s" % title[:60])
-                lines.append("Markets: %d total, %d active" % (len(mkts),len(active)))
-                for m in active[:2]:
-                    q      = m.get("question","")
-                    tokens = m.get("tokens") or []
-                    lines.append("  • %s | tokens:%d" % (q[:50],len(tokens)))
-                    for t in tokens:
-                        oc  = t.get("outcome","?")
-                        tid = t.get("tokenId") or t.get("token_id","?")
-                        pr  = t.get("price","?")
-                        lines.append("    %s price=%s tid=%s" % (oc,pr,str(tid)[:20]))
-            else:
+            if not events or not events[0]:
                 lines.append("empty: %s" % slug)
+                continue
+            ev    = events[0]
+            title = ev.get("title","?")
+            mkts  = ev.get("markets",[])
+            lines.append("SLUG: %s" % slug)
+            lines.append("Title: %s" % title[:60])
+            for m in mkts:
+                if m.get("closed",True): continue
+                cid = m.get("conditionId") or m.get("condition_id") or m.get("id","?")
+                lines.append("cid: %s" % str(cid)[:40])
+                # Пробуємо CLOB
+                try:
+                    rc = requests.get(
+                        "https://clob.polymarket.com/markets/%s" % cid,
+                        timeout=15)
+                    if rc.status_code == 200:
+                        tokens = rc.json().get("tokens",[])
+                        lines.append("CLOB tokens: %d" % len(tokens))
+                        for t in tokens:
+                            oc  = t.get("outcome","?")
+                            tid = t.get("token_id") or t.get("tokenId","?")
+                            pr  = t.get("price","?")
+                            lines.append("  %s: price=%s tid=%s" % (oc, pr, str(tid)[:25]))
+                    else:
+                        lines.append("CLOB HTTP %d" % rc.status_code)
+                except Exception as e:
+                    lines.append("CLOB error: %s" % str(e)[:60])
+            lines.append("")
         except Exception as e:
-            lines.append("error %s: %s" % (slug, str(e)[:50]))
+            lines.append("error %s: %s" % (slug, str(e)[:60]))
 
     await u.message.reply_text("\n".join(lines)[:4000])
 
