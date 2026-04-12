@@ -1,295 +1,129 @@
-import asyncio, logging, json, time, datetime, os, csv, io, requests
+"""
+BTC Polymarket Trading Bot
+Magic.Link акаунт | Polygon | 10% від балансу
+Railway deployment — тільки TELEGRAM_BOT_TOKEN + OPENAI_API_KEY
+"""
+import asyncio, logging, json, time, datetime, os, io, requests
 from openai import OpenAI
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
-OI_CACHE_FILE      = "oi_cache.json"
-SIGNALS_DUMP       = "signals_dump.json"
+OI_CACHE           = "oi_cache.json"
+DUMP_FILE          = "signals_dump.json"
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-# ============================================================
-# SESSION
-# ============================================================
-class UserSession:
+# ─────────────────────────────────────────────
+# СЕСІЯ КОРИСТУВАЧА
+# ─────────────────────────────────────────────
+class Session:
     def __init__(self, uid):
-        self.uid            = uid
-        self.private_key    = ""
-        self.wallet_address = None
-        self.wallet_ok      = False
-        self.poly_ok        = False
-        self.auto_active    = False
-        self.signal_history = []
-        self.trade_history  = []
-        self.pending_trade  = {}
-        self.wallet_state   = None
-        self.tmp_key        = None
-        self.history_file   = "history_%d.json" % uid
-        self.errors_file    = "errors_%d.json" % uid
+        self.uid          = uid
+        self.key          = ""      # Magic.Link приватний ключ
+        self.funder       = ""      # Polymarket proxy адреса (funder)
+        self.address      = None
+        self.ok           = False
+        self.auto         = False
+        self.signals      = []
+        self.trades       = []
+        self.state        = None    # "key" / "funder"
+        self.tmp_key      = None
+        self.hist_file    = "hist_%d.json" % uid
+        self.err_file     = "err_%d.json"  % uid
         self._load()
 
     def _load(self):
         try:
-            if os.path.exists(self.history_file):
-                with open(self.history_file) as f:
-                    self.signal_history = json.load(f)
+            if os.path.exists(self.hist_file):
+                with open(self.hist_file) as f:
+                    self.signals = json.load(f)
         except Exception: pass
 
-    def save_history(self):
+    def save(self):
         try:
-            with open(self.history_file, "w") as f:
-                json.dump(self.signal_history, f, ensure_ascii=False, indent=2)
+            with open(self.hist_file, "w") as f:
+                json.dump(self.signals, f, ensure_ascii=False, indent=2)
         except Exception: pass
 
-    def save_error(self, sig):
+    def log_err(self, sig):
         try:
             e = []
-            if os.path.exists(self.errors_file):
-                with open(self.errors_file) as f: e = json.load(f)
+            if os.path.exists(self.err_file):
+                with open(self.err_file) as f: e = json.load(f)
             e.append(sig); e = e[-300:]
-            with open(self.errors_file, "w") as f: json.dump(e, f, ensure_ascii=False, indent=2)
+            with open(self.err_file, "w") as f: json.dump(e, f, ensure_ascii=False, indent=2)
         except Exception: pass
 
-    def calc_bet(self, balance):
-        if not balance or balance <= 0: return 0.0
-        return round(max(1.0, min(balance * 0.10, 500.0)), 2)
+    def bet_size(self, bal):
+        if not bal or bal <= 0: return 0.0
+        return round(max(1.0, min(bal * 0.10, 500.0)), 2)
 
 _sessions = {}
-def get_session(uid):
+def sess(uid):
     if uid not in _sessions:
-        _sessions[uid] = UserSession(uid)
+        _sessions[uid] = Session(uid)
     return _sessions[uid]
 
-# ============================================================
-# WALLET
-# ============================================================
-def connect_wallet(s, private_key: str):
-    try:
-        key = private_key.strip().replace(" ","").replace("\n","").replace("\r","")
-        clean = key.lower()
-        if clean.startswith("0x"): clean = clean[2:]
-        if len(clean) != 64:
-            return False, "Key must be 64 hex chars (got %d).\nGet from: polymarket.com -> Profile -> Export Private Key" % len(clean)
-        try: int(clean, 16)
-        except ValueError: return False, "Invalid characters in key"
-        s.private_key = "0x" + clean
-        s.wallet_ok   = True
-        try:
-            from eth_account import Account
-            s.wallet_address = Account.from_key(s.private_key).address
-        except Exception:
-            s.wallet_address = "0x" + clean[:8] + "..."
-        s.poly_ok = True
-        print("[Wallet] Connected: %s" % s.wallet_address)
-        return True, s.wallet_address
-    except Exception as e:
-        return False, str(e)
+# ─────────────────────────────────────────────
+# POLYMARKET КЛІЄНТ
+# ─────────────────────────────────────────────
+def make_client(s):
+    """
+    Правильна ініціалізація для Magic.Link акаунту Polymarket.
+    signature_type=1 + funder = proxy адреса що тримає кошти.
+    """
+    from py_clob_client.client import ClobClient
+    from py_clob_client.constants import POLYGON
+    return ClobClient(
+        host       = "https://clob.polymarket.com",
+        key        = s.key,
+        chain_id   = POLYGON,
+        signature_type = 1,      # 1 = Magic.Link / proxy wallet
+        funder     = s.funder,   # адреса що тримає USDC на Polymarket
+    )
 
-# ============================================================
-# BALANCE — прямий HTTP без py-clob-client
-# ============================================================
+def get_creds(client):
+    """Отримуємо або створюємо API credentials."""
+    try:
+        return client.create_or_derive_api_creds()
+    except Exception:
+        try:    return client.derive_api_key()
+        except Exception: return client.create_api_key()
+
+# ─────────────────────────────────────────────
+# БАЛАНС
+# ─────────────────────────────────────────────
 def get_balance(s):
-    """
-    Читає баланс з Polymarket.
-    /balance-allowance потребує API key credentials, не L1 підпис напряму.
-    Тому: спочатку отримуємо API key через L1, потім читаємо баланс через API key.
-    """
-    if not s.wallet_ok:
-        return None, "Wallet not connected"
+    if not s.ok: return None, "Гаманець не підключено"
     try:
-        from eth_account import Account
-        from eth_account.messages import encode_defunct
-
-        key     = s.private_key
-        account = Account.from_key(key)
-        address = account.address
-        s.wallet_address = address
-
-        def l1_headers(method, path, body=""):
-            ts  = str(int(time.time()))
-            msg = encode_defunct(text=ts + method + path + body)
-            sig = "0x" + account.sign_message(msg).signature.hex()
-            return {"POLY_ADDRESS":address,"POLY_SIGNATURE":sig,
-                    "POLY_TIMESTAMP":ts,"POLY_NONCE":"0","Content-Type":"application/json"}
-
-        # Крок 1: отримуємо API key через L1
-        r = requests.get("https://clob.polymarket.com/auth/api-key",
-                         headers=l1_headers("GET","/auth/api-key"), timeout=15)
-        print("[Balance] auth HTTP %d: %s" % (r.status_code, r.text[:80]))
-
-        if r.status_code == 200:
-            cr = r.json()
-        else:
-            # Створюємо новий API key
-            r2 = requests.post("https://clob.polymarket.com/auth/api-key",
-                               headers=l1_headers("POST","/auth/api-key"), timeout=15)
-            print("[Balance] create key HTTP %d: %s" % (r2.status_code, r2.text[:80]))
-            if r2.status_code not in (200,201):
-                print("[Balance] Cannot get API key")
-                return 0.0, address
-            cr = r2.json()
-
-        api_key = cr.get("apiKey") or cr.get("api_key","")
-        secret  = cr.get("secret","")
-        passph  = cr.get("passphrase","")
-        print("[Balance] Got API key: %s..." % api_key[:12])
-
-        # Крок 2: читаємо баланс з API key
-        import hmac as _h, hashlib, base64
-        ts2     = str(int(time.time()))
-        path2   = "/balance-allowance?asset_type=USDC"
-        sign_s  = ts2 + "GET" + path2
-        asig    = base64.b64encode(_h.new(secret.encode(), sign_s.encode(), hashlib.sha256).digest()).decode()
-
-        rb = requests.get(
-            "https://clob.polymarket.com/balance-allowance",
-            params={"asset_type":"USDC"},
-            headers={"POLY-API-KEY":api_key,"POLY-SIGNATURE":asig,
-                     "POLY-TIMESTAMP":ts2,"POLY-PASSPHRASE":passph},
-            timeout=15)
-        print("[Balance] balance HTTP %d: %s" % (rb.status_code, rb.text[:100]))
-
-        if rb.status_code == 200:
-            data = rb.json()
-            raw  = float(data.get("balance") or 0)
-            # Polymarket зберігає в мікро-USDC (6 decimals)
-            bal  = raw / 1e6 if raw > 1000 else raw
-            bal  = round(bal, 2)
-            print("[Balance] $%.2f" % bal)
-            return bal, address
-
-        return 0.0, address
-
-    except Exception as e:
-        print("[Balance] Exception: %s" % e)
-        return 0.0, s.wallet_address or "error"
-
-
-def place_bet(s, direction: str, amount: float) -> dict:
-    if not s.wallet_ok:
-        return {"success":False,"error":"Wallet not connected"}
-    if amount < 1:
-        return {"success":False,"error":"Min $1"}
-
-    # Спроба 1: py-clob-client
-    try:
-        from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import OrderArgs, OrderType, Side
-        from py_clob_client.constants import POLYGON
-
-        market = find_btc_market()
-        if not market:
-            return {"success":False,"error":"No active BTC market found"}
-
-        token_id = market["token_id_yes"] if direction=="UP" else market["token_id_no"]
-        price    = max(0.01, min(0.99, float(market["price_yes"] if direction=="UP" else market["price_no"])))
-        size     = round(amount / price, 2)
-
-        key    = s.private_key
-        client = ClobClient(host="https://clob.polymarket.com", key=key,
-                            chain_id=POLYGON, signature_type=0)
-
-        raw = client.derive_api_key()
-        if isinstance(raw, dict):
-            from py_clob_client.clob_types import ApiCreds
-            creds = ApiCreds(api_key=raw.get("apiKey",""),
-                             api_secret=raw.get("secret",""),
-                             api_passphrase=raw.get("passphrase",""))
-        else:
-            creds = raw
+        client = make_client(s)
+        creds  = get_creds(client)
         client.set_api_creds(creds)
-
-        try:
-            fresh = float(client.get_midpoint(token_id) or price)
-            if 0.01 <= fresh <= 0.99: price=fresh; size=round(amount/price,2)
-        except Exception: pass
-
-        print("[BET] py-clob dir=%s price=%.4f size=%.2f"%(direction,price,size))
-        order = client.create_order(OrderArgs(token_id=token_id,price=price,size=size,side=Side.BUY))
-        resp  = client.post_order(order, OrderType.GTC)
-        print("[BET] OK: %s" % str(resp)[:80])
-        return {"success":True,"order":resp,"price":price,
-                "pot":round(size-amount,2),"market_name":market["question"][:60]}
-
-    except ImportError:
-        print("[BET] py-clob-client not installed, using HTTP...")
+        info   = client.get_balance_allowance(params={"asset_type": "USDC"})
+        raw    = float(info.get("balance") or 0)
+        bal    = raw / 1e6 if raw > 1000 else raw
+        print("[Balance] raw=%s bal=%.2f" % (raw, bal))
+        return round(bal, 2), s.funder
     except Exception as e:
-        print("[BET] py-clob error: %s" % str(e)[:150])
-        if "No active BTC" in str(e): return {"success":False,"error":str(e)}
+        print("[Balance] Error: %s" % e)
+        return 0.0, s.funder or "error"
 
-    # Спроба 2: прямий HTTP
-    try:
-        import json as _j, hmac as _h, hashlib, base64
-        from eth_account import Account
-        from eth_account.messages import encode_defunct
+# ─────────────────────────────────────────────
+# ПОШУК МАРКЕТУ
+# ─────────────────────────────────────────────
+def find_market():
+    """
+    Знаходить поточний раунд Bitcoin Up or Down - 15 min.
+    Slug: btc-updown-15m-{timestamp кратний 900}
+    Токени: через CLOB /markets/{condition_id}
+    """
+    SLUG = "btc-updown-15m-"
+    ROUND = 900
 
-        market = find_btc_market()
-        if not market: return {"success":False,"error":"No active BTC market found"}
-
-        token_id = market["token_id_yes"] if direction=="UP" else market["token_id_no"]
-        price    = max(0.01, min(0.99, float(market["price_yes"] if direction=="UP" else market["price_no"])))
-        size     = round(amount / price, 2)
-
-        account = Account.from_key(s.private_key)
-        address = account.address
-
-        def l1(method, path, body=""):
-            ts  = str(int(time.time()))
-            sig = "0x" + account.sign_message(encode_defunct(text=ts+method+path+body)).signature.hex()
-            return ts, sig, {"POLY_ADDRESS":address,"POLY_SIGNATURE":sig,"POLY_TIMESTAMP":ts,"POLY_NONCE":"0","Content-Type":"application/json"}
-
-        ts,sig,hdrs = l1("GET","/auth/api-key")
-        r = requests.get("https://clob.polymarket.com/auth/api-key",headers=hdrs,timeout=15)
-        print("[BET] auth HTTP %d: %s"%(r.status_code,r.text[:80]))
-        if r.status_code != 200:
-            ts,sig,hdrs = l1("POST","/auth/api-key")
-            r = requests.post("https://clob.polymarket.com/auth/api-key",headers=hdrs,timeout=15)
-            if r.status_code not in (200,201):
-                return {"success":False,"error":"Auth HTTP%d: %s"%(r.status_code,r.text[:100])}
-
-        cr     = r.json()
-        apikey = cr.get("apiKey",""); secret=cr.get("secret",""); passph=cr.get("passphrase","")
-
-        try:
-            rp=requests.get("https://clob.polymarket.com/midpoints",params={"token_id":token_id},timeout=10)
-            if rp.status_code==200:
-                mid=float(rp.json().get("mid",price))
-                if 0.01<=mid<=0.99: price=mid; size=round(amount/price,2)
-        except Exception: pass
-
-        print("[BET] HTTP dir=%s price=%.4f size=%.2f"%(direction,price,size))
-        ots  = str(int(time.time()))
-        body = _j.dumps({"order":{"salt":str(int(time.time()*1000)),"maker":address,"signer":address,
-            "taker":"0x0000000000000000000000000000000000000000","tokenId":token_id,
-            "makerAmount":str(int(amount*1e6)),"takerAmount":str(int(size*1e6)),
-            "expiration":"0","nonce":"0","feeRateBps":"0","side":"BUY","signatureType":0,"signature":"0x"},
-            "orderType":"GTC","owner":address},separators=(',',':'))
-        asig = base64.b64encode(_h.new(secret.encode(),( ots+"POST"+"/order"+body).encode(),hashlib.sha256).digest()).decode()
-        ro   = requests.post("https://clob.polymarket.com/order",data=body,
-                             headers={"POLY-API-KEY":apikey,"POLY-SIGNATURE":asig,
-                                      "POLY-TIMESTAMP":ots,"POLY-PASSPHRASE":passph,
-                                      "Content-Type":"application/json"},timeout=20)
-        print("[BET] order HTTP %d: %s"%(ro.status_code,ro.text[:150]))
-        if ro.status_code in (200,201):
-            return {"success":True,"order":ro.json(),"price":price,
-                    "pot":round(size-amount,2),"market_name":market["question"][:60]}
-        return {"success":False,"error":"Order HTTP%d: %s"%(ro.status_code,ro.text[:150])}
-    except Exception as e:
-        err=str(e); print("[BET] FAIL: %s"%err)
-        if "insufficient" in err.lower(): return {"success":False,"error":"Insufficient USDC"}
-        return {"success":False,"error":err[:200]}
-
-# ============================================================
-# FIND MARKET
-# ============================================================
-def find_btc_market():
-    SLUG_PREFIX = "btc-updown-15m-"
-    ROUND_SEC   = 900
-
-    def parse_end(m):
+    def end_ts(m):
         for f in ("end_date_iso","endDate","endDateIso","end_time","endTime","end_date"):
             v = m.get(f)
             if not v: continue
@@ -299,174 +133,285 @@ def find_btc_market():
                 except Exception: pass
         return None
 
-    def get_tokens(cid):
+    def tokens(cid):
         try:
-            r = requests.get("https://clob.polymarket.com/markets/%s"%cid, timeout=15)
-            if r.status_code != 200: return None,None,0.5,0.5
-            tokens = r.json().get("tokens",[])
-            ty_id=tn_id=""; ty_pr=tn_pr=0.5
-            for t in tokens:
-                oc=(t.get("outcome") or "").upper().strip()
-                tid=(t.get("token_id") or t.get("tokenId") or "").strip()
-                pr=float(t.get("price",0.5) or 0.5)
-                if oc in ("YES","UP","HIGHER","ABOVE"): ty_id=tid; ty_pr=pr
-                elif oc in ("NO","DOWN","LOWER","BELOW"): tn_id=tid; tn_pr=pr
-            if not ty_id and tokens: ty_id=(tokens[0].get("token_id") or tokens[0].get("tokenId") or "").strip(); ty_pr=float(tokens[0].get("price",0.5) or 0.5)
-            if not tn_id and len(tokens)>1: tn_id=(tokens[1].get("token_id") or tokens[1].get("tokenId") or "").strip(); tn_pr=float(tokens[1].get("price",0.5) or 0.5)
-            return ty_id,tn_id,ty_pr,tn_pr
-        except Exception as e: print("[Market] token err: %s"%e); return None,None,0.5,0.5
+            r = requests.get("https://clob.polymarket.com/markets/%s" % cid, timeout=15)
+            if r.status_code != 200: return None, None, 0.5, 0.5
+            toks = r.json().get("tokens", [])
+            yi = ni = ""; yp = np_ = 0.5
+            for t in toks:
+                oc  = (t.get("outcome") or "").upper()
+                tid = (t.get("token_id") or t.get("tokenId") or "").strip()
+                pr  = float(t.get("price", 0.5) or 0.5)
+                if oc in ("YES","UP","HIGHER","ABOVE"):   yi=tid; yp=pr
+                elif oc in ("NO","DOWN","LOWER","BELOW"): ni=tid; np_=pr
+            if not yi and toks: yi=(toks[0].get("token_id") or toks[0].get("tokenId") or "").strip(); yp=float(toks[0].get("price",0.5) or 0.5)
+            if not ni and len(toks)>1: ni=(toks[1].get("token_id") or toks[1].get("tokenId") or "").strip(); np_=float(toks[1].get("price",0.5) or 0.5)
+            return yi, ni, yp, np_
+        except Exception as e:
+            print("[Market] Tokens err: %s" % e)
+            return None, None, 0.5, 0.5
 
-    def try_slug(slug, now_ts):
+    def try_slug(slug, now):
         try:
-            r=requests.get("https://gamma-api.polymarket.com/events",params={"slug":slug},timeout=15)
-            if r.status_code!=200: return None
-            raw=r.json(); events=raw if isinstance(raw,list) else [raw] if isinstance(raw,dict) and raw else []
-            if not events: return None
-            ev=events[0]; title=ev.get("title","") or slug
-            print("[Market] Event: %s"%title[:60])
-            for m in ev.get("markets",[]):
-                if m.get("closed",True): continue
-                cid=(m.get("conditionId") or m.get("condition_id") or m.get("id") or "").strip()
+            r = requests.get("https://gamma-api.polymarket.com/events",
+                             params={"slug": slug}, timeout=15)
+            if r.status_code != 200: return None
+            raw = r.json()
+            evs = raw if isinstance(raw, list) else ([raw] if isinstance(raw, dict) and raw else [])
+            if not evs: return None
+            ev = evs[0]
+            print("[Market] Event: %s" % (ev.get("title","") or slug)[:60])
+            for m in ev.get("markets", []):
+                if m.get("closed", True): continue
+                cid = (m.get("conditionId") or m.get("condition_id") or m.get("id") or "").strip()
                 if not cid: continue
-                end_ts=parse_end(m); diff=(end_ts-now_ts) if end_ts else 900.0
-                if diff<=0: continue
-                ty_id,tn_id,ty_pr,tn_pr=get_tokens(cid)
-                if not ty_id or not tn_id: print("[Market] No tokens for %s"%cid[:20]); continue
-                q=m.get("question","") or title
-                print("[MARKET] FOUND: %s"%q[:60])
-                print("[TOKENS] YES=%s NO=%s"%(ty_id[:20],tn_id[:20]))
-                return {"condition_id":cid,"token_id_yes":ty_id,"token_id_no":tn_id,
-                        "price_yes":ty_pr,"price_no":tn_pr,"question":q,"diff_sec":round(diff,1)}
-        except Exception as e: print("[Market] slug err: %s"%e)
+                et  = end_ts(m)
+                diff = (et - now) if et else 900.0
+                if diff <= 0: continue
+                yi, ni, yp, np_ = tokens(cid)
+                if not yi or not ni:
+                    print("[Market] No tokens for %s" % cid[:20]); continue
+                q = m.get("question","") or ev.get("title","BTC")
+                print("[Market] ЗНАЙДЕНО: %s" % q[:60])
+                print("[Market] YES=%s NO=%s" % (yi[:20], ni[:20]))
+                return {"cid":cid,"yes_id":yi,"no_id":ni,"yes_p":yp,"no_p":np_,"q":q,"diff":round(diff,1)}
+        except Exception as e:
+            print("[Market] Slug err: %s" % e)
         return None
 
-    def scan():
-        now_ts=time.time(); current=int(now_ts//ROUND_SEC)*ROUND_SEC
-        print("[Market] Searching at %s UTC"%datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S"))
-        for ts in [current, current+ROUND_SEC, current-ROUND_SEC]:
-            slug="%s%d"%(SLUG_PREFIX,ts)
-            print("[Market] Trying: %s"%slug)
-            result=try_slug(slug, now_ts)
-            if result: return result
-        return None
+    now = time.time()
+    cur = int(now // ROUND) * ROUND
+    for attempt in range(1, 8):
+        print("[Market] Спроба %d/7 | %s UTC" % (attempt, datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S")))
+        for ts in [cur, cur + ROUND, cur - ROUND]:
+            r = try_slug("%s%d" % (SLUG, ts), now)
+            if r: return r
+        if attempt < 7:
+            print("[Market] Не знайдено, повтор через 3с...")
+            time.sleep(3)
+    print("[Market] НЕ ЗНАЙДЕНО")
+    return None
 
-    for attempt in range(1,8):
-        print("[Market] Attempt %d/7"%attempt)
-        result=scan()
-        if result: return result
-        if attempt<7: print("[Market] Retry in 3s..."); time.sleep(3)
-    print("[Market] NOT FOUND"); return None
+# ─────────────────────────────────────────────
+# РОЗМІЩЕННЯ СТАВКИ
+# ─────────────────────────────────────────────
+def place_bet(s, direction: str, amount: float) -> dict:
+    """
+    Magic.Link: signature_type=1 + funder адреса.
+    create_or_derive_api_creds() — правильний метод для цього типу акаунту.
+    """
+    if not s.ok:    return {"ok":False,"err":"Гаманець не підключено"}
+    if amount < 1:  return {"ok":False,"err":"Мінімум $1"}
 
-# ============================================================
-# BINANCE
-# ============================================================
-def safe_get(url, params=None, timeout=15):
-    try: return requests.get(url,params=params,timeout=timeout).json()
+    mkt = find_market()
+    if not mkt: return {"ok":False,"err":"Активний маркет не знайдено"}
+
+    token_id = mkt["yes_id"] if direction=="UP" else mkt["no_id"]
+    price    = mkt["yes_p"]  if direction=="UP" else mkt["no_p"]
+    price    = max(0.01, min(0.99, float(price)))
+    size     = round(amount / price, 2)
+
+    print("[Bet] dir=%s token=%s price=%.4f size=%.2f usdc=%.2f" % (
+        direction, token_id[:20], price, size, amount))
+
+    try:
+        from py_clob_client.clob_types import OrderArgs, OrderType, Side
+
+        client = make_client(s)
+        creds  = get_creds(client)
+        client.set_api_creds(creds)
+
+        # Оновлюємо ціну з CLOB
+        try:
+            fresh = float(client.get_midpoint(token_id) or price)
+            if 0.01 <= fresh <= 0.99:
+                price = fresh; size = round(amount/price, 2)
+                print("[Bet] Свіжа ціна: %.4f" % price)
+        except Exception: pass
+
+        order = client.create_order(OrderArgs(
+            token_id=token_id, price=price, size=size, side=Side.BUY))
+        resp  = client.post_order(order, OrderType.GTC)
+        print("[Bet] OK: %s" % str(resp)[:100])
+        return {"ok":True,"resp":resp,"price":price,
+                "pot":round(size-amount,2),"mkt":mkt["q"][:60]}
+
+    except ImportError:
+        return {"ok":False,"err":"py-clob-client не встановлено. Перевір requirements.txt"}
+    except Exception as e:
+        err = str(e)
+        print("[Bet] FAIL: %s" % err)
+        if "not enough balance" in err.lower() or "allowance" in err.lower():
+            return {"ok":False,"err":"Недостатньо USDC на Polymarket"}
+        if "insufficient" in err.lower():
+            return {"ok":False,"err":"Недостатньо коштів"}
+        if "401" in err or "invalid" in err.lower():
+            return {"ok":False,"err":"Помилка авторизації: %s" % err[:100]}
+        return {"ok":False,"err":err[:200]}
+
+# ─────────────────────────────────────────────
+# BINANCE DATA
+# ─────────────────────────────────────────────
+def sget(url, p=None, t=15):
+    try: return requests.get(url, params=p, timeout=t).json()
     except Exception: return None
 
-def fetch_candles(interval, limit):
+def candles(iv, lim):
     for _ in range(3):
-        d=safe_get("https://fapi.binance.com/fapi/v1/klines",{"symbol":"BTCUSDT","interval":interval,"limit":limit})
+        d = sget("https://fapi.binance.com/fapi/v1/klines",{"symbol":"BTCUSDT","interval":iv,"limit":lim})
         if d and isinstance(d,list): break
         time.sleep(2)
     if not d or not isinstance(d,list):
-        d=safe_get("https://api.binance.com/api/v3/klines",{"symbol":"BTCUSDT","interval":interval,"limit":limit})
+        d = sget("https://api.binance.com/api/v3/klines",{"symbol":"BTCUSDT","interval":iv,"limit":lim})
     if not d or not isinstance(d,list): return []
     return [{"t":int(k[0]),"o":float(k[1]),"h":float(k[2]),"l":float(k[3]),"c":float(k[4]),"v":float(k[5])} for k in d]
 
-def fetch_price():
+def price_now():
     for url,p in [("https://fapi.binance.com/fapi/v1/ticker/price",{"symbol":"BTCUSDT"}),
-                  ("https://api.binance.com/api/v3/ticker/price",{"symbol":"BTCUSDT"})]:
-        d=safe_get(url,p)
+                  ("https://api.binance.com/api/v3/ticker/price",  {"symbol":"BTCUSDT"})]:
+        d=sget(url,p)
         if d and "price" in d: return float(d["price"])
     return None
 
-def fetch_funding():
-    d=safe_get("https://fapi.binance.com/fapi/v1/premiumIndex",{"symbol":"BTCUSDT"})
-    if not d or not isinstance(d,dict): return {"rate":0.0,"sentiment":"NEUTRAL","mark":0.0,"basis":0.0}
-    fr=float(d.get("lastFundingRate",0)); mark=float(d.get("markPrice",0)); idx=float(d.get("indexPrice",mark))
-    return {"rate":fr,"sentiment":"LONGS_TRAPPED" if fr>0.0005 else "SHORTS_TRAPPED" if fr<-0.0003 else "NEUTRAL","mark":mark,"basis":round(mark-idx,2)}
+def funding():
+    d=sget("https://fapi.binance.com/fapi/v1/premiumIndex",{"symbol":"BTCUSDT"})
+    if not d or not isinstance(d,dict): return {"rate":0.0,"sent":"NEUTRAL","mark":0.0,"basis":0.0}
+    fr=float(d.get("lastFundingRate",0)); mk=float(d.get("markPrice",0)); ix=float(d.get("indexPrice",mk))
+    return {"rate":fr,"sent":"LONGS_TRAPPED" if fr>0.0005 else "SHORTS_TRAPPED" if fr<-0.0003 else "NEUTRAL","mark":mk,"basis":round(mk-ix,2)}
 
-def fetch_liquidations():
-    d=safe_get("https://fapi.binance.com/fapi/v1/forceOrders",{"symbol":"BTCUSDT","limit":200})
-    if not d or isinstance(d,dict): d=safe_get("https://fapi.binance.com/fapi/v1/allForceOrders",{"symbol":"BTCUSDT","limit":200})
-    if not d or not isinstance(d,list): return {"liq_longs":0.0,"liq_shorts":0.0,"signal":"NEUTRAL","exhaustion":False,"total_usd":0.0}
-    cutoff=int(time.time()*1000)-900000
-    recent=[x for x in d if isinstance(x,dict) and int(x.get("time",0))>=cutoff] or d[:50]
-    ll=sum(float(x.get("origQty",0))*float(x.get("price",0)) for x in recent if x.get("side")=="SELL")
-    ls=sum(float(x.get("origQty",0))*float(x.get("price",0)) for x in recent if x.get("side")=="BUY")
-    return {"liq_longs":round(ll,2),"liq_shorts":round(ls,2),
-            "signal":"SHORT_SQUEEZE_FUEL" if ls>ll*2 else "LONG_CASCADE_FUEL" if ll>ls*2 else "NEUTRAL",
-            "exhaustion":(ll+ls)>5_000_000,"total_usd":round(ll+ls,2)}
+def liqs():
+    d=sget("https://fapi.binance.com/fapi/v1/forceOrders",{"symbol":"BTCUSDT","limit":200})
+    if not d or isinstance(d,dict): d=sget("https://fapi.binance.com/fapi/v1/allForceOrders",{"symbol":"BTCUSDT","limit":200})
+    if not d or not isinstance(d,list): return {"ll":0.0,"ls":0.0,"sig":"NEUTRAL","exh":False}
+    cut=int(time.time()*1000)-900000
+    rec=[x for x in d if isinstance(x,dict) and int(x.get("time",0))>=cut] or d[:50]
+    ll=sum(float(x.get("origQty",0))*float(x.get("price",0)) for x in rec if x.get("side")=="SELL")
+    ls=sum(float(x.get("origQty",0))*float(x.get("price",0)) for x in rec if x.get("side")=="BUY")
+    return {"ll":round(ll,2),"ls":round(ls,2),"sig":"SHORT_SQUEEZE" if ls>ll*2 else "LONG_CASCADE" if ll>ls*2 else "NEUTRAL","exh":(ll+ls)>5e6}
 
-def fetch_oi():
-    d=safe_get("https://fapi.binance.com/fapi/v1/openInterest",{"symbol":"BTCUSDT"})
+def oi_data():
+    d=sget("https://fapi.binance.com/fapi/v1/openInterest",{"symbol":"BTCUSDT"})
     if not d or not isinstance(d,dict): return 0.0,0.0
     cur=float(d.get("openInterest",0))
     try:
         prev=cur
-        if os.path.exists(OI_CACHE_FILE):
-            with open(OI_CACHE_FILE) as f: prev=json.load(f).get("oi",cur)
-        with open(OI_CACHE_FILE,"w") as f: json.dump({"oi":cur},f)
+        if os.path.exists(OI_CACHE):
+            with open(OI_CACHE) as f: prev=json.load(f).get("oi",cur)
+        with open(OI_CACHE,"w") as f: json.dump({"oi":cur},f)
         return cur,round((cur-prev)/prev*100,4) if prev>0 else 0.0
     except Exception: return cur,0.0
 
-def fetch_orderbook():
+def orderbook():
     try:
-        d=safe_get("https://fapi.binance.com/fapi/v1/depth",{"symbol":"BTCUSDT","limit":20})
-        if not d or not isinstance(d,dict): return {"imbalance":0.0,"bias":"NEUTRAL"}
-        bids=sum(float(b[1]) for b in d.get("bids",[])[:10]); asks=sum(float(a[1]) for a in d.get("asks",[])[:10])
-        total=bids+asks; imb=round((bids-asks)/total*100,2) if total>0 else 0.0
-        return {"imbalance":imb,"bias":"BID_HEAVY" if imb>20 else "ASK_HEAVY" if imb<-20 else "BALANCED"}
-    except Exception: return {"imbalance":0.0,"bias":"NEUTRAL"}
+        d=sget("https://fapi.binance.com/fapi/v1/depth",{"symbol":"BTCUSDT","limit":20})
+        if not d or not isinstance(d,dict): return {"imb":0.0,"bias":"NEUTRAL"}
+        b=sum(float(x[1]) for x in d.get("bids",[])[:10]); a=sum(float(x[1]) for x in d.get("asks",[])[:10])
+        t=b+a; imb=round((b-a)/t*100,2) if t>0 else 0.0
+        return {"imb":imb,"bias":"BID_HEAVY" if imb>20 else "ASK_HEAVY" if imb<-20 else "BALANCED"}
+    except Exception: return {"imb":0.0,"bias":"NEUTRAL"}
 
-def fetch_lsr():
+def lsr():
     try:
-        d=safe_get("https://fapi.binance.com/futures/data/topLongShortPositionRatio",{"symbol":"BTCUSDT","period":"15m","limit":3})
-        if not d or not isinstance(d,list): return {"ratio":1.0,"long_pct":50.0,"bias":"NEUTRAL"}
-        lat=d[-1]; ratio=float(lat.get("longShortRatio",1.0)); lp=float(lat.get("longAccount",0.5))*100
-        return {"ratio":round(ratio,3),"long_pct":round(lp,1),"bias":"CROWD_LONG" if ratio>1.5 else "CROWD_SHORT" if ratio<0.7 else "NEUTRAL"}
-    except Exception: return {"ratio":1.0,"long_pct":50.0,"bias":"NEUTRAL"}
+        d=sget("https://fapi.binance.com/futures/data/topLongShortPositionRatio",{"symbol":"BTCUSDT","period":"15m","limit":3})
+        if not d or not isinstance(d,list): return {"ratio":1.0,"lp":50.0,"bias":"NEUTRAL"}
+        lat=d[-1]; r=float(lat.get("longShortRatio",1.0)); lp=float(lat.get("longAccount",0.5))*100
+        return {"ratio":round(r,3),"lp":round(lp,1),"bias":"CROWD_LONG" if r>1.5 else "CROWD_SHORT" if r<0.7 else "NEUTRAL"}
+    except Exception: return {"ratio":1.0,"lp":50.0,"bias":"NEUTRAL"}
 
-# ============================================================
-# SMC
-# ============================================================
-def swing_points(c):
+# ─────────────────────────────────────────────
+# SMC АНАЛІЗ
+# ─────────────────────────────────────────────
+def swings(c):
     sh,sl=[],[]
     for i in range(2,len(c)-2):
         h=c[i]["h"]
-        if h>c[i-1]["h"] and h>c[i+1]["h"] and h>c[i-2]["h"] and h>c[i+2]["h"]: sh.append({"price":h,"idx":i})
+        if h>c[i-1]["h"] and h>c[i+1]["h"] and h>c[i-2]["h"] and h>c[i+2]["h"]: sh.append({"p":h,"i":i})
         l=c[i]["l"]
-        if l<c[i-1]["l"] and l<c[i+1]["l"] and l<c[i-2]["l"] and l<c[i+2]["l"]: sl.append({"price":l,"idx":i})
+        if l<c[i-1]["l"] and l<c[i+1]["l"] and l<c[i-2]["l"] and l<c[i+2]["l"]: sl.append({"p":l,"i":i})
     return sh[-5:],sl[-5:]
 
-def market_structure(c):
-    sh,sl=swing_points(c)
+def structure(c):
+    sh,sl=swings(c)
     if len(sh)<2 or len(sl)<2: return "RANGING"
-    hs=[x["price"] for x in sh]; ls=[x["price"] for x in sl]
+    hs=[x["p"] for x in sh]; ls=[x["p"] for x in sl]
     if all(hs[i]>hs[i-1] for i in range(1,len(hs))) and all(ls[i]>ls[i-1] for i in range(1,len(ls))): return "BULLISH"
     if all(hs[i]<hs[i-1] for i in range(1,len(hs))) and all(ls[i]<ls[i-1] for i in range(1,len(ls))): return "BEARISH"
     return "RANGING"
 
-def liq_sweep(c):
+def sweep(c):
     if len(c)<10: return {"type":"NONE","level":0.0,"ago":0}
-    sh,sl=swing_points(c[:-3])
+    sh,sl=swings(c[:-3])
     for i,x in enumerate(reversed(c[-5:])):
         for s in reversed(sh):
-            if x["h"]>s["price"] and x["c"]<s["price"]: return {"type":"HIGH","level":s["price"],"ago":i+1}
+            if x["h"]>s["p"] and x["c"]<s["p"]: return {"type":"HIGH","level":s["p"],"ago":i+1}
         for s in reversed(sl):
-            if x["l"]<s["price"] and x["c"]>s["price"]: return {"type":"LOW","level":s["price"],"ago":i+1}
+            if x["l"]<s["p"] and x["c"]>s["p"]: return {"type":"LOW","level":s["p"],"ago":i+1}
     return {"type":"NONE","level":0.0,"ago":0}
 
-def stop_clusters(c,price):
-    sh,sl=swing_points(c)
-    above=[{"price":s["price"],"type":"swing_high"} for s in sh if s["price"]>price]
-    below=[{"price":s["price"],"type":"swing_low"} for s in sl if s["price"]<price]
-    sa=min(above,key=lambda x:x["price"]-price) if above else None
-    sb=min(below,key=lambda x:price-x["price"]) if below else None
-    return sa,sb
+def amd(c15,c5,price):
+    if len(c15)<20: return {"phase":"NONE","dir":None,"conf":0,"reason":""}
+    l10=c15[-10:]; l3=c15[-3:]; l35=c5[-3:] if len(c5)>=3 else []
+    rng=(max(x["h"] for x in l10)-min(x["l"] for x in l10))/price*100
+    ab=sum(abs(x["c"]-x["o"]) for x in l10)/len(l10)/price*100
+    acc=rng<0.6 and ab<0.10
+    sw15=sweep(c15); sw5=sweep(c5) if len(c5)>=10 else {"type":"NONE","level":0.0,"ago":0}
+    sw=sw15 if sw15["type"]!="NONE" and sw15["ago"]<=4 else sw5
+    manip=sw["type"]!="NONE" and sw["ago"]<=4
+    mc=None
+    if l35:
+        mv=(l35[-1]["c"]-l35[0]["o"])/l35[0]["o"]*100
+        mc="UP" if mv>0.05 else "DOWN" if mv<-0.05 else None
+    lm=(l3[-1]["c"]-l3[0]["o"])/l3[0]["o"]*100
+    if manip and acc:
+        if sw["type"]=="LOW": return {"phase":"MANIPULATION_DONE","dir":"UP","conf":3 if mc=="UP" else 2,"reason":"ACCUM+SWEEP_LOW UP"}
+        lc=c15[-1]["c"]
+        if lc<sw["level"]*0.9998: return {"phase":"MANIPULATION_DONE","dir":"DOWN","conf":3 if mc=="DOWN" else 2,"reason":"SWEEP_HIGH+CLOSE_BELOW DOWN"}
+        return {"phase":"MANIPULATION_DONE","dir":"UP","conf":1,"reason":"SWEEP_HIGH+HOLDS UP"}
+    if acc: return {"phase":"ACCUMULATION","dir":None,"conf":1,"reason":"tight range"}
+    if manip:
+        lc=c15[-1]["c"]; d="DOWN" if sw["type"]=="HIGH" and lc<sw["level"]*0.9998 else "UP"
+        return {"phase":"MANIPULATION","dir":d,"conf":2,"reason":"SWEEP_%s" % sw["type"]}
+    if abs(lm)>0.15: return {"phase":"DISTRIBUTION","dir":"UP" if lm>0 else "DOWN","conf":1,"reason":"active move"}
+    return {"phase":"NONE","dir":None,"conf":0,"reason":""}
 
-def find_fvg(c,price):
+def manip_detect(c,sw,price):
+    r={"trap":"NONE","hint":None}
+    if len(c)<5: return r
+    last=c[-1]; body=abs(last["c"]-last["o"]); total=last["h"]-last["l"]
+    if total>0:
+        uw=last["h"]-max(last["c"],last["o"]); lw=min(last["c"],last["o"])-last["l"]; wr=1-(body/total)
+        if wr>0.7 and total/last["c"]>0.002:
+            if uw>lw*2: r.update({"trap":"WICK_TRAP_HIGH","hint":"DOWN"})
+            elif lw>uw*2: r.update({"trap":"WICK_TRAP_LOW","hint":"UP"})
+    if sw["type"]!="NONE" and sw["ago"]<=3:
+        if sw["type"]=="HIGH" and last["c"]<sw["level"]*0.9995: r.update({"trap":"SWEEP_TRAP_HIGH","hint":"DOWN"})
+        elif sw["type"]=="LOW" and last["c"]>sw["level"]*1.0005: r.update({"trap":"SWEEP_TRAP_LOW","hint":"UP"})
+    return r
+
+def vol_class(c15):
+    if len(c15)<10: return "UNKNOWN",0.0
+    rng=[(x["h"]-x["l"])/x["c"]*100 for x in c15[-10:]]
+    avg=sum(rng)/len(rng); rec=sum(rng[-3:])/3; pri=sum(rng[:7])/7
+    return ("LOW_VOL" if avg<0.08 else "EXPANSION" if rec>pri*1.5 else "HIGH_VOL" if avg>0.3 else "NORMAL"),round(avg,4)
+
+def session():
+    h=datetime.datetime.now(datetime.timezone.utc).hour
+    if 7<=h<12:    return "LONDON",1
+    elif 12<=h<17: return "NY_OPEN",0
+    elif 17<=h<21: return "NY_PM",0
+    elif 21<=h or h<3: return "ASIA",0
+    return "DEAD",-1
+
+def mkt_regime(c15):
+    if len(c15)<10: return "RANGING"
+    cl=[x["c"] for x in c15[-12:]]
+    ups=sum(1 for i in range(1,len(cl)) if cl[i]>cl[i-1])
+    if ups>=9 or (len(cl)-1-ups)>=9: return "TRENDING"
+    alts=sum(1 for i in range(1,len(cl)-1) if (cl[i]>cl[i-1])!=(cl[i+1]>cl[i]))
+    return "CHOPPY" if alts>=8 else "RANGING"
+
+def fvg(c,price):
     fa=fb=None
     for i in range(1,len(c)-1):
         pv,nx=c[i-1],c[i+1]
@@ -478,191 +423,134 @@ def find_fvg(c,price):
             if mid>price and (fa is None or dist<fa["dist"]): fa={"top":pv["l"],"bot":nx["h"],"dist":dist}
     return fa,fb
 
-def bos_choch(c,htf):
+def bos(c,htf):
     if len(c)<5: return None
-    sh,sl=swing_points(c[:-1])
+    sh,sl=swings(c[:-1])
     if not sh or not sl: return None
     cl=c[-1]["c"]
-    if cl>sh[-1]["price"]: return {"type":"CHoCH" if htf=="BEARISH" else "BOS","dir":"UP","level":sh[-1]["price"]}
-    if cl<sl[-1]["price"]: return {"type":"CHoCH" if htf=="BULLISH" else "BOS","dir":"DOWN","level":sl[-1]["price"]}
+    if cl>sh[-1]["p"]: return {"type":"CHoCH" if htf=="BEARISH" else "BOS","dir":"UP","level":sh[-1]["p"]}
+    if cl<sl[-1]["p"]: return {"type":"CHoCH" if htf=="BULLISH" else "BOS","dir":"DOWN","level":sl[-1]["p"]}
     return None
 
-def detect_amd(c15,c5m,price):
-    if len(c15)<20: return {"phase":"NONE","direction":None,"confidence":0,"reason":""}
-    last10=c15[-10:]; last3=c15[-3:]; l3_5=c5m[-3:] if len(c5m)>=3 else []
-    rng=(max(x["h"] for x in last10)-min(x["l"] for x in last10))/price*100
-    avg_b=sum(abs(x["c"]-x["o"]) for x in last10)/len(last10)/price*100
-    is_acc=rng<0.6 and avg_b<0.10
-    sw15=liq_sweep(c15); sw5=liq_sweep(c5m) if len(c5m)>=10 else {"type":"NONE","level":0.0,"ago":0}
-    sweep=sw15 if sw15["type"]!="NONE" and sw15["ago"]<=4 else sw5
-    manip=sweep["type"]!="NONE" and sweep["ago"]<=4
-    mc=None
-    if l3_5:
-        mv=(l3_5[-1]["c"]-l3_5[0]["o"])/l3_5[0]["o"]*100
-        mc="UP" if mv>0.05 else "DOWN" if mv<-0.05 else None
-    lm=(last3[-1]["c"]-last3[0]["o"])/last3[0]["o"]*100
-    if manip and is_acc:
-        if sweep["type"]=="LOW": return {"phase":"MANIPULATION_DONE","direction":"UP","confidence":3 if mc=="UP" else 2,"reason":"ACCUM+SWEEP_LOW UP"}
-        lc=c15[-1]["c"]
-        if lc<sweep["level"]*0.9998: return {"phase":"MANIPULATION_DONE","direction":"DOWN","confidence":3 if mc=="DOWN" else 2,"reason":"SWEEP_HIGH+CLOSE_BELOW DOWN"}
-        return {"phase":"MANIPULATION_DONE","direction":"UP","confidence":1,"reason":"SWEEP_HIGH+HOLDS UP"}
-    if is_acc: return {"phase":"ACCUMULATION","direction":None,"confidence":1,"reason":"tight range"}
-    if manip:
-        lc=c15[-1]["c"]
-        d="DOWN" if sweep["type"]=="HIGH" and lc<sweep["level"]*0.9998 else "UP"
-        return {"phase":"MANIPULATION","direction":d,"confidence":2,"reason":"SWEEP_%s"%sweep["type"]}
-    if abs(lm)>0.15: return {"phase":"DISTRIBUTION","direction":"UP" if lm>0 else "DOWN","confidence":1,"reason":"active move"}
-    return {"phase":"NONE","direction":None,"confidence":0,"reason":""}
+def stops(c,price):
+    sh,sl=swings(c)
+    above=[{"p":s["p"],"type":"swing_high"} for s in sh if s["p"]>price]
+    below=[{"p":s["p"],"type":"swing_low"}  for s in sl if s["p"]<price]
+    sa=min(above,key=lambda x:x["p"]-price) if above else None
+    sb=min(below,key=lambda x:price-x["p"]) if below else None
+    return sa,sb
 
-def detect_manip(c,sweep,price):
-    r={"trap_type":"NONE","reversal_signal":None}
-    if len(c)<5: return r
-    last=c[-1]; body=abs(last["c"]-last["o"]); total=last["h"]-last["l"]
-    if total>0:
-        uw=last["h"]-max(last["c"],last["o"]); lw=min(last["c"],last["o"])-last["l"]; wr=1-(body/total)
-        if wr>0.7 and total/last["c"]>0.002:
-            if uw>lw*2: r.update({"trap_type":"WICK_TRAP_HIGH","reversal_signal":"DOWN"})
-            elif lw>uw*2: r.update({"trap_type":"WICK_TRAP_LOW","reversal_signal":"UP"})
-    if sweep["type"]!="NONE" and sweep["ago"]<=3:
-        if sweep["type"]=="HIGH" and last["c"]<sweep["level"]*0.9995: r.update({"trap_type":"SWEEP_TRAP_HIGH","reversal_signal":"DOWN"})
-        elif sweep["type"]=="LOW" and last["c"]>sweep["level"]*1.0005: r.update({"trap_type":"SWEEP_TRAP_LOW","reversal_signal":"UP"})
-    return r
-
-def classify_vol(c15):
-    if len(c15)<10: return "UNKNOWN",0.0
-    ranges=[(x["h"]-x["l"])/x["c"]*100 for x in c15[-10:]]
-    avg=sum(ranges)/len(ranges); rec=sum(ranges[-3:])/3; pri=sum(ranges[:7])/7
-    return ("LOW_VOL" if avg<0.08 else "EXPANSION" if rec>pri*1.5 else "HIGH_VOL" if avg>0.3 else "NORMAL"),round(avg,4)
-
-def classify_session():
-    h=datetime.datetime.now(datetime.timezone.utc).hour
-    if 7<=h<12: return "LONDON",1
-    elif 12<=h<17: return "NY_OPEN",0
-    elif 17<=h<21: return "NY_AFTERNOON",0
-    elif 21<=h or h<3: return "ASIA_ACTIVE",0
-    return "DEAD_HOURS",-1
-
-def classify_mkt(c15,c5m):
-    if len(c15)<10: return "RANGING"
-    closes=[x["c"] for x in c15[-12:]]
-    ups=sum(1 for i in range(1,len(closes)) if closes[i]>closes[i-1])
-    if ups>=9 or (len(closes)-1-ups)>=9: return "TRENDING"
-    alts=sum(1 for i in range(1,len(closes)-1) if (closes[i]>closes[i-1])!=(closes[i+1]>closes[i]))
-    return "CHOPPY" if alts>=8 else "RANGING"
-
-def get_payload(s):
-    c15=fetch_candles("15m",100); c5m=fetch_candles("5m",50); c1m=fetch_candles("1m",30)
+def payload(s):
+    c15=candles("15m",100); c5=candles("5m",50); c1=candles("1m",30)
     if not c15: return None
-    price=c15[-1]["c"]; prev=c15[-2]["c"] if len(c15)>=2 else price
-    chg15=round((price-prev)/prev*100,4)
-    chg5=round((c5m[-1]["c"]-c5m[-4]["c"])/c5m[-4]["c"]*100,4) if len(c5m)>=4 else 0.0
+    px=c15[-1]["c"]; prev=c15[-2]["c"] if len(c15)>=2 else px
+    chg15=round((px-prev)/prev*100,4)
+    chg5=round((c5[-1]["c"]-c5[-4]["c"])/c5[-4]["c"]*100,4) if len(c5)>=4 else 0.0
     mom3=round((c15[-1]["c"]-c15[-4]["c"])/c15[-4]["c"]*100,4) if len(c15)>=4 else 0.0
-    mic=round((c1m[-1]["c"]-c1m[-4]["c"])/c1m[-4]["c"]*100,4) if len(c1m)>=4 else 0.0
-    st15=market_structure(c15) if len(c15)>=6 else "RANGING"
-    st5=market_structure(c5m) if len(c5m)>=6 else "RANGING"
-    st1=market_structure(c1m) if len(c1m)>=6 else "RANGING"
-    sw15=liq_sweep(c15); sw5=liq_sweep(c5m) if c5m else {"type":"NONE","level":0.0,"ago":0}
-    sw1=liq_sweep(c1m) if c1m else {"type":"NONE","level":0.0,"ago":0}
-    sa,sb=stop_clusters(c15,price)
-    f5a,f5b=find_fvg(c5m[-30:],price) if len(c5m)>=5 else (None,None)
-    f1a,f1b=find_fvg(c1m[-20:],price) if len(c1m)>=5 else (None,None)
-    bc5=bos_choch(c5m,st15) if len(c5m)>=5 else None
-    manip=detect_manip(c5m[-10:] if len(c5m)>=10 else c15[-10:],sw5,price)
-    amd=detect_amd(c15,c5m,price)
-    fund=fetch_funding(); liqs=fetch_liquidations(); oi,oi_chg=fetch_oi()
-    ob=fetch_orderbook(); lsr=fetch_lsr()
-    vc,vs=classify_vol(c15); sess,sb2=classify_session(); mkt=classify_mkt(c15,c5m)
-    da=round((sa["price"]-price)/price*100,4) if sa else 999.0
-    db=round((price-sb["price"])/price*100,4) if sb else 999.0
+    mic=round((c1[-1]["c"]-c1[-4]["c"])/c1[-4]["c"]*100,4) if len(c1)>=4 else 0.0
+    st15=structure(c15) if len(c15)>=6 else "RANGING"
+    st5=structure(c5) if len(c5)>=6 else "RANGING"
+    st1=structure(c1) if len(c1)>=6 else "RANGING"
+    sw15=sweep(c15); sw5=sweep(c5) if c5 else {"type":"NONE","level":0.0,"ago":0}
+    sw1=sweep(c1) if c1 else {"type":"NONE","level":0.0,"ago":0}
+    sa,sb=stops(c15,px)
+    f5a,f5b=fvg(c5[-30:],px) if len(c5)>=5 else (None,None)
+    f1a,f1b=fvg(c1[-20:],px) if len(c1)>=5 else (None,None)
+    bc5=bos(c5,st15) if len(c5)>=5 else None
+    mn=manip_detect(c5[-10:] if len(c5)>=10 else c15[-10:],sw5,px)
+    ad=amd(c15,c5,px)
+    fn=funding(); lq=liqs(); oi,oic=oi_data(); ob=orderbook(); ls=lsr()
+    vc,vs=vol_class(c15); sess,sb2=session(); reg=mkt_regime(c15)
+    da=round((sa["p"]-px)/px*100,4) if sa else 999.0
+    db=round((px-sb["p"])/px*100,4) if sb else 999.0
     last_s="no_prev"
-    if s.signal_history:
-        last=s.signal_history[-1]
-        last_s="prev=%s outcome=%s"%(last.get("decision","?"),last.get("outcome","PENDING"))
+    if s.signals:
+        last=s.signals[-1]
+        last_s="prev=%s outcome=%s"%(last.get("dec","?"),last.get("outcome","PENDING"))
     return {
-        "timestamp":datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "ts":datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "ts_unix":int(time.time()),
-        "price":{"current":price,"chg_15m":chg15,"chg_5m":chg5,"momentum_3":mom3,"micro_mom":mic,"mark":fund["mark"],"basis":fund["basis"]},
-        "structure":{"15m":st15,"5m":st5,"1m":st1},
-        "liquidity":{"sweep_15m":sw15,"sweep_5m":sw5,"sweep_1m":sw1,"stops_above":sa,"stops_below":sb,
-                     "dist_above":da,"dist_below":db,"fvg5_above":f5a,"fvg5_below":f5b,"fvg1_above":f1a,"fvg1_below":f1b,"bos_choch_5m":bc5},
-        "amd":amd,"manipulation":manip,
-        "positioning":{"funding_rate":fund["rate"],"funding_sent":fund["sentiment"],
-                       "liq_longs":liqs["liq_longs"],"liq_shorts":liqs["liq_shorts"],"liq_signal":liqs["signal"],
-                       "exhaustion":liqs["exhaustion"],"liq_total":liqs["total_usd"],
-                       "oi":oi,"oi_change":oi_chg,"ob_bias":ob["bias"],"ob_imbalance":ob["imbalance"],
-                       "lsr_bias":lsr["bias"],"lsr_ratio":lsr["ratio"],"crowd_long":lsr["long_pct"]},
-        "context":{"volatility":vc,"vol_score":vs,"session":sess,"session_boost":sb2,"market_condition":mkt,"last_signal":last_s},
+        "price":{"cur":px,"chg15":chg15,"chg5":chg5,"mom3":mom3,"mic":mic,"mark":fn["mark"],"basis":fn["basis"]},
+        "struct":{"15m":st15,"5m":st5,"1m":st1},
+        "liq":{"sw15":sw15,"sw5":sw5,"sw1":sw1,"sa":sa,"sb":sb,"da":da,"db":db,
+               "f5a":f5a,"f5b":f5b,"f1a":f1a,"f1b":f1b,"bos5":bc5},
+        "amd":ad,"manip":mn,
+        "pos":{"fr":fn["rate"],"fs":fn["sent"],"ll":lq["ll"],"ls":lq["ls"],"lsig":lq["sig"],
+               "exh":lq["exh"],"oi":oi,"oic":oic,"ob":ob["bias"],"obi":ob["imb"],
+               "lsr":ls["bias"],"lsrr":ls["ratio"],"cl":ls["lp"]},
+        "ctx":{"vol":vc,"vs":vs,"sess":sess,"sb2":sb2,"reg":reg,"last":last_s},
     }
 
-# ============================================================
-# AI
-# ============================================================
-SYSTEM_PROMPT="""You are an elite BTC short-term trader. Predict UP or DOWN in 15 minutes on Polymarket.
-Analyze from scratch. Do NOT copy previous signal.
+# ─────────────────────────────────────────────
+# AI АНАЛІЗ
+# ─────────────────────────────────────────────
+SYS="""You are an elite BTC short-term trader. Predict UP or DOWN in 15 minutes on Polymarket.
+Analyze fresh every time. Do NOT repeat previous signal direction.
 TIMEFRAMES: 15m=context | 5m=tactics | 1m=execution
 AMD: SWEEP_LOW+close_above=UP(+3) | SWEEP_HIGH+close_below=DOWN(+3) | SWEEP_HIGH+holds=UP(+1)
-SCORING: +3AMD | +2CHoCH/BOS | -2CASCADE | +1/-1 FVG/session | STRENGTH: >=5=HIGH 3-4=MEDIUM 1-2=LOW
-OUTPUT JSON: {"decision":"UP or DOWN","strength":"HIGH or MEDIUM or LOW","confidence_score":<int>,
+SCORING: +3AMD | +2CHoCH/BOS/SQUEEZE | -2CASCADE | +1/-1 FVG/session
+STRENGTH: >=5=HIGH | 3-4=MEDIUM | 1-2=LOW | ALWAYS UP or DOWN
+OUTPUT JSON only: {"decision":"UP or DOWN","strength":"HIGH or MEDIUM or LOW","confidence_score":<int>,
 "market_condition":"TRENDING or RANGING or CHOPPY","key_signal":"one sentence",
 "logic":"2-3 sentences Ukrainian","reasons":["r1","r2","r3"],"risk_note":"risk or NONE"}"""
 
-def analyze_with_ai(payload,s):
+def analyze(p,s):
     try:
         client=OpenAI(api_key=OPENAI_API_KEY)
-        liq=payload["liquidity"]; pos=payload["positioning"]; pr=payload["price"]
-        st=payload["structure"]; ctx=payload["context"]; manip=payload["manipulation"]; amd=payload["amd"]
-        sw15=liq.get("sweep_15m",{}); sw5=liq.get("sweep_5m",{}); sw1=liq.get("sweep_1m",{})
-        bc5=liq.get("bos_choch_5m"); f5a=liq.get("fvg5_above"); f5b=liq.get("fvg5_below")
-        sa=liq.get("stops_above") or {}; sb_=liq.get("stops_below") or {}
-        msg=("Time:%s Sess:%s Last:%s\nPRICE:$%.2f 15m:%+.4f%% 5m:%+.4f%% Mom3:%+.4f%% Micro:%+.4f%%\n"
-             "STRUCT:15m=%s 5m=%s 1m=%s Mkt:%s Vol:%s\nAMD:%s->%s conf=%d [%s]\n"
+        liq=p["liq"]; pos=p["pos"]; pr=p["price"]
+        st=p["struct"]; ctx=p["ctx"]; mn=p["manip"]; ad=p["amd"]
+        sw15=liq.get("sw15",{}); sw5=liq.get("sw5",{}); sw1=liq.get("sw1",{})
+        bc5=liq.get("bos5"); f5a=liq.get("f5a"); f5b=liq.get("f5b")
+        sa=liq.get("sa") or {}; sb=liq.get("sb") or {}
+        msg=("Time:%s Sess:%s Last:%s\nPRICE:$%.2f 15m:%+.4f%% 5m:%+.4f%% Mom3:%+.4f%% Mic:%+.4f%%\n"
+             "STRUCT:15m=%s 5m=%s 1m=%s Reg:%s Vol:%s\nAMD:%s->%s conf=%d [%s]\n"
              "Sw15m:%s@%.2f(%dc) Sw5m:%s@%.2f(%dc) Sw1m:%s@%.2f(%dc)\n"
-             "Up:%.3f%% Dn:%.3f%% BOS5m:%s FVG5:up=%s dn=%s Trap:%s hint=%s\n"
-             "Fund:%+.6f(%s) LiqL:$%.0f LiqS:$%.0f Sig:%s\nOI:%+.4f%% Book:%s(%+.1f%%) L/S:%.3f(%s) CrowdL:%.1f%%")%(
-            payload["timestamp"],ctx["session"],ctx["last_signal"],
-            pr["current"],pr["chg_15m"],pr["chg_5m"],pr["momentum_3"],pr["micro_mom"],
-            st["15m"],st["5m"],st["1m"],ctx["market_condition"],ctx["volatility"],
-            amd.get("phase","NONE"),amd.get("direction","?"),amd.get("confidence",0),amd.get("reason",""),
+             "StopsUp:%.3f%% StopsDn:%.3f%% BOS5m:%s FVG5:up=%s dn=%s Trap:%s hint=%s\n"
+             "Fund:%+.6f(%s) LiqL:$%.0f LiqS:$%.0f Sig:%s\nOI:%+.4f%% Book:%s(%+.1f%%) L/S:%.3f(%s) CL:%.1f%%")%(
+            p["ts"],ctx["sess"],ctx["last"],
+            pr["cur"],pr["chg15"],pr["chg5"],pr["mom3"],pr["mic"],
+            st["15m"],st["5m"],st["1m"],ctx["reg"],ctx["vol"],
+            ad.get("phase","NONE"),ad.get("dir","?"),ad.get("conf",0),ad.get("reason",""),
             sw15.get("type","N"),sw15.get("level",0),sw15.get("ago",0),
             sw5.get("type","N"),sw5.get("level",0),sw5.get("ago",0),
             sw1.get("type","N"),sw1.get("level",0),sw1.get("ago",0),
-            liq.get("dist_above",999),liq.get("dist_below",999),
+            liq.get("da",999),liq.get("db",999),
             ("%s %s@%.2f"%(bc5["type"],bc5["dir"],bc5["level"])) if bc5 else "none",
             ("%.3f%%"%f5a["dist"]) if f5a else "none",("%.3f%%"%f5b["dist"]) if f5b else "none",
-            manip["trap_type"],str(manip["reversal_signal"]),
-            pos["funding_rate"],pos["funding_sent"],pos["liq_longs"],pos["liq_shorts"],pos["liq_signal"],
-            pos["oi_change"],pos["ob_bias"],pos["ob_imbalance"],pos["lsr_ratio"],pos["lsr_bias"],pos["crowd_long"])
+            mn["trap"],str(mn["hint"]),
+            pos["fr"],pos["fs"],pos["ll"],pos["ls"],pos["lsig"],
+            pos["oic"],pos["ob"],pos["obi"],pos["lsrr"],pos["lsr"],pos["cl"])
         resp=client.chat.completions.create(model="gpt-4o",
-             messages=[{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":msg}],
+             messages=[{"role":"system","content":SYS},{"role":"user","content":msg}],
              temperature=0.1,response_format={"type":"json_object"})
         return json.loads(resp.choices[0].message.content)
     except Exception as e:
-        logger.error("AI: %s",e); return None
+        log.error("AI: %s",e); return None
 
-# ============================================================
-# STATS / UTILS
-# ============================================================
-def check_signals(s):
+# ─────────────────────────────────────────────
+# СТАТИСТИКА
+# ─────────────────────────────────────────────
+def check_outcomes(s):
     now=int(time.time()); changed=False
-    for sig in s.signal_history:
+    for sig in s.signals:
         if sig.get("outcome"): continue
         if now-sig.get("ts_unix",0)>=900:
-            cur=fetch_price()
+            cur=price_now()
             if cur:
-                entry=sig.get("entry_price",0); dec=sig.get("decision","")
+                entry=sig.get("entry",0); dec=sig.get("dec","")
                 outcome="WIN" if (dec=="UP" and cur>entry) or (dec=="DOWN" and cur<entry) else "LOSS"
-                sig["outcome"]=outcome; sig["exit_price"]=cur; sig["real_move"]=round(cur-entry,2)
+                sig["outcome"]=outcome; sig["exit"]=cur; sig["move"]=round(cur-entry,2)
                 changed=True
-                if outcome=="LOSS": s.save_error(sig)
-    if changed: s.save_history()
+                if outcome=="LOSS": s.log_err(sig)
+    if changed: s.save()
 
-def stats_text(s):
-    if not s.signal_history: return "No data yet."
-    checked=[g for g in s.signal_history if g.get("outcome")]
-    if not checked: return "Checking results..."
+def stats(s):
+    if not s.signals: return "Даних поки немає."
+    checked=[g for g in s.signals if g.get("outcome")]
+    if not checked: return "Перевіряємо результати..."
     wins=[g for g in checked if g["outcome"]=="WIN"]; total=len(checked)
     wr=round(len(wins)/total*100,1)
-    lines=["STATS","Total:%d WIN:%d Winrate:%.1f%%"%(total,len(wins),wr),""]
+    lines=["СТАТИСТИКА","Всього:%d  Перемоги:%d  Вінрейт:%.1f%%"%(total,len(wins),wr),""]
     for st in ("HIGH","MEDIUM","LOW"):
         sub=[g for g in checked if g.get("strength")==st]
         if sub:
@@ -670,377 +558,354 @@ def stats_text(s):
             lines.append("%s: %d/%d (%.1f%%)"%(st,w,len(sub),round(w/len(sub)*100,1)))
     return "\n".join(lines)
 
-def get_news():
-    try:
-        d=safe_get("https://min-api.cryptocompare.com/data/v2/news/",{"categories":"BTC,Bitcoin","lTs":0})
-        if d and "Data" in d:
-            lines=[]; bkw=["bull","surge","rally","etf"]; skw=["bear","drop","crash","dump","ban"]
-            for item in d["Data"][:5]:
-                t=item.get("title","").lower(); p=sum(1 for k in bkw if k in t); n=sum(1 for k in skw if k in t)
-                lines.append("[%s] %s"%("BULLISH" if p>n else "BEARISH" if n>p else "NEUTRAL",item.get("title","")[:70]))
-            return "\n".join(lines)
-    except Exception: pass
-    return "News unavailable"
-
-# ============================================================
-# KEYBOARD
-# ============================================================
-def kb_main(s):
-    w="✅ Wallet OK" if s.wallet_ok else "🔗 Connect Wallet"
-    a="🔴 Auto OFF"  if s.auto_active else "🟢 Auto ON"
+# ─────────────────────────────────────────────
+# КЛАВІАТУРА
+# ─────────────────────────────────────────────
+def kb(s):
+    w = "Гаманець: OK" if s.ok else "Підключити гаманець"
+    a = "Авто: ВИМК"   if s.auto else "Авто: УВІМК"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(w,callback_data="wallet_connect"),
-         InlineKeyboardButton(a,callback_data="toggle_auto")],
-        [InlineKeyboardButton("💰 Balance",   callback_data="show_balance"),
-         InlineKeyboardButton("📊 Stats",     callback_data="show_stats")],
-        [InlineKeyboardButton("🔍 Analyze",   callback_data="analyze_now"),
-         InlineKeyboardButton("📁 Export CSV",callback_data="download_log")],
-        [InlineKeyboardButton("🏪 Test Market",callback_data="test_market"),
-         InlineKeyboardButton("🔎 Raw Market",callback_data="raw_market")],
-        [InlineKeyboardButton("📰 News",      callback_data="show_news"),
-         InlineKeyboardButton("📉 Errors",    callback_data="show_errors")],
+        [InlineKeyboardButton(w, callback_data="wallet"),
+         InlineKeyboardButton(a, callback_data="auto_toggle")],
+        [InlineKeyboardButton("Баланс",    callback_data="balance"),
+         InlineKeyboardButton("Статистика",callback_data="stats")],
+        [InlineKeyboardButton("Аналіз",    callback_data="analyze"),
+         InlineKeyboardButton("Маркет",    callback_data="market")],
+        [InlineKeyboardButton("Новини",    callback_data="news"),
+         InlineKeyboardButton("Помилки",   callback_data="errors")],
     ])
 
 WELCOME=(
-    "🤖 BTC Polymarket Bot\n\n"
-    "Signals every 15min :00 :15 :30 :45 UTC\n"
-    "Stake: 10% of Polymarket balance\n\n"
-    "━━━━━━━━━━━━━━━━━━━━━━\n"
-    "SETUP:\n\n"
-    "1️⃣  Press 🔗 Connect Wallet\n"
-    "     Enter your Polymarket key\n"
-    "     polymarket.com → Profile →\n"
-    "     Developer → Export Private Key\n\n"
-    "2️⃣  Press 🟢 Auto ON\n\n"
-    "━━━━━━━━━━━━━━━━━━━━━━\n"
-    "✅ No MetaMask needed\n"
-    "✅ No MATIC for gas\n"
-    "✅ Funds stay on Polymarket\n"
-    "✅ Magic.Link supported"
+    "BTC Polymarket Bot\n\n"
+    "Сигнали кожні 15 хв — :00 :15 :30 :45 UTC\n"
+    "Ставка — 10% від балансу Polymarket\n\n"
+    "Як підключити:\n\n"
+    "1. Натисни «Підключити гаманець»\n"
+    "2. Введи приватний ключ\n"
+    "   polymarket.com → Profile → Export Private Key\n"
+    "3. Введи Polymarket адресу\n"
+    "   polymarket.com → Deposit → скопіюй адресу\n"
+    "4. Натисни «Авто: УВІМК»\n\n"
+    "Поповнення через polymarket.com → Deposit\n"
+    "Мережа: Polygon | Без MATIC для газу"
 )
 
-# ============================================================
-# COMMANDS
-# ============================================================
+# ─────────────────────────────────────────────
+# КОМАНДИ
+# ─────────────────────────────────────────────
 async def cmd_start(u,c):
-    s=get_session(u.effective_user.id)
-    await u.message.reply_text(WELCOME,reply_markup=kb_main(s))
-
-async def cmd_help(u,c):
-    await cmd_start(u,c)
-
-async def cmd_analyze(u,c):
-    s=get_session(u.effective_user.id)
-    await u.message.reply_text("🔍 Analyzing...")
-    await run_cycle(c.application,s)
+    s=sess(u.effective_user.id)
+    await u.message.reply_text(WELCOME, reply_markup=kb(s))
 
 async def cmd_stats(u,c):
-    s=get_session(u.effective_user.id)
-    check_signals(s)
-    await u.message.reply_text(stats_text(s))
+    s=sess(u.effective_user.id)
+    check_outcomes(s)
+    await u.message.reply_text(stats(s))
+
+async def cmd_analyze(u,c):
+    s=sess(u.effective_user.id)
+    await u.message.reply_text("Аналізую ринок...")
+    await cycle(c.application, s)
 
 async def cmd_autoon(u,c):
-    s=get_session(u.effective_user.id)
-    if not s.wallet_ok:
-        await u.message.reply_text("First connect wallet. Press 🔗 Connect Wallet"); return
-    s.auto_active=True
-    bal,_=get_balance(s); bet=s.calc_bet(bal) if bal else 0.0
-    await u.message.reply_text("🟢 Auto ON\n\nBalance: %s\nStake: $%.2f (10%%)\n\nSignals :00 :15 :30 :45 UTC"%(
-        ("$%.2f"%bal) if bal else "N/A",bet),reply_markup=kb_main(s))
+    s=sess(u.effective_user.id)
+    if not s.ok: await u.message.reply_text("Спочатку підключи гаманець."); return
+    s.auto=True
+    bal,_=get_balance(s); bet=s.bet_size(bal) if bal else 0.0
+    await u.message.reply_text("Авто-торгівля увімкнена\n\nБаланс: %s\nСтавка: $%.2f (10%%)\n\nСигнали :00 :15 :30 :45 UTC"%(
+        ("$%.2f"%bal) if bal else "невідомо", bet), reply_markup=kb(s))
 
 async def cmd_autooff(u,c):
-    s=get_session(u.effective_user.id)
-    s.auto_active=False
-    await u.message.reply_text("🔴 Auto OFF",reply_markup=kb_main(s))
+    s=sess(u.effective_user.id); s.auto=False
+    await u.message.reply_text("Авто-торгівля вимкнена.", reply_markup=kb(s))
 
-async def cmd_balance(u,c):
-    s=get_session(u.effective_user.id)
-    await u.message.reply_text("Checking...")
-    bal,info=get_balance(s)
-    if bal is not None:
-        await u.message.reply_text("💰 Balance: $%.2f USDC\n🎯 Next stake: $%.2f (10%%)"%(bal,s.calc_bet(bal)))
-    else:
-        await u.message.reply_text("❌ %s"%info)
-
-# ============================================================
+# ─────────────────────────────────────────────
 # CALLBACKS
-# ============================================================
-async def handle_callback(u,c):
-    s=get_session(u.effective_user.id)
+# ─────────────────────────────────────────────
+async def on_callback(u,c):
+    s=sess(u.effective_user.id)
     q=u.callback_query; await q.answer()
 
-    if q.data=="wallet_connect":
-        s.wallet_state="await_key"; s.tmp_key=None
+    if q.data=="wallet":
+        s.state="key"; s.tmp_key=None
         await q.message.reply_text(
-            "🔐 CONNECT WALLET\n\n"
-            "Enter your Polymarket private key\n\n"
-            "Where to find:\n"
-            "polymarket.com → Profile (top right) →\n"
-            "Developer → Export Private Key\n\n"
-            "⚠️ This is Polymarket key, NOT MetaMask!\n"
-            "✅ No MATIC needed\n\n"
-            "Enter key (64 hex chars):")
+            "ПІДКЛЮЧЕННЯ ГАМАНЦЯ\n\n"
+            "Крок 1/2 — Приватний ключ\n\n"
+            "Де знайти:\n"
+            "polymarket.com → Profile (праворуч вгорі)\n"
+            "→ Developer → Export Private Key\n\n"
+            "Це ключ від POLYMARKET, не MetaMask.\n"
+            "Не потрібен MATIC для газу.\n\n"
+            "Введи ключ (64 hex символи):")
 
-    elif q.data=="toggle_auto":
-        if not s.wallet_ok:
-            await q.message.reply_text("First connect wallet!"); return
-        if s.auto_active:
-            s.auto_active=False
-            await q.message.reply_text("🔴 Auto OFF",reply_markup=kb_main(s))
+    elif q.data=="auto_toggle":
+        if not s.ok: await q.message.reply_text("Спочатку підключи гаманець."); return
+        if s.auto:
+            s.auto=False
+            await q.message.reply_text("Авто-торгівля вимкнена.", reply_markup=kb(s))
         else:
-            s.auto_active=True
-            bal,_=get_balance(s); bet=s.calc_bet(bal) if bal else 0.0
-            await q.message.reply_text("🟢 Auto ON\n\nBalance: %s\nStake: $%.2f (10%%)\n\n:00 :15 :30 :45 UTC"%(
-                ("$%.2f"%bal) if bal else "N/A",bet),reply_markup=kb_main(s))
+            s.auto=True
+            bal,_=get_balance(s); bet=s.bet_size(bal) if bal else 0.0
+            await q.message.reply_text(
+                "Авто-торгівля увімкнена\n\nБаланс: %s\nСтавка: $%.2f (10%%)"%(
+                    ("$%.2f"%bal) if bal else "невідомо", bet),
+                reply_markup=kb(s))
 
-    elif q.data=="show_balance":
+    elif q.data=="balance":
         bal,_=get_balance(s)
         if bal is not None:
-            await q.message.reply_text("💰 $%.2f USDC\n🎯 Stake: $%.2f (10%%)"%(bal,s.calc_bet(bal)))
+            await q.message.reply_text("Баланс: $%.2f USDC\nСтавка: $%.2f (10%%)"%(bal,s.bet_size(bal)))
         else:
-            await q.message.reply_text("❌ Cannot read balance. Check Railway logs.")
+            await q.message.reply_text("Не вдалось отримати баланс. Перевір логи Railway.")
 
-    elif q.data=="show_stats":
-        check_signals(s); await q.message.reply_text(stats_text(s))
+    elif q.data=="stats":
+        check_outcomes(s); await q.message.reply_text(stats(s))
 
-    elif q.data=="analyze_now":
-        await q.message.reply_text("🔍 Analyzing...")
-        await run_cycle(c.application,s)
+    elif q.data=="analyze":
+        await q.message.reply_text("Аналізую...")
+        await cycle(c.application,s)
 
-    elif q.data=="download_log":
-        if not s.signal_history:
-            await q.message.reply_text("No signals yet."); return
-        buf=io.StringIO()
-        import csv as _csv
-        w=_csv.DictWriter(buf,fieldnames=["ts","decision","strength","outcome","entry_price","exit_price","real_move","key_signal","session","mkt_cond"],extrasaction="ignore")
-        w.writeheader()
-        for sig in s.signal_history:
-            row={k:sig.get(k,"") for k in ["decision","strength","outcome","entry_price","exit_price","real_move","key_signal","session","mkt_cond"]}
-            row["ts"]=sig.get("time",""); w.writerow(row)
-        fname="signals_%s.csv"%datetime.datetime.now().strftime("%Y%m%d_%H%M")
-        await q.message.reply_document(document=buf.getvalue().encode(),filename=fname,caption="%d records"%len(s.signal_history))
-
-    elif q.data=="test_market":
-        await q.message.reply_text("🔍 Searching market...")
-        m=find_btc_market()
+    elif q.data=="market":
+        await q.message.reply_text("Шукаю маркет...")
+        m=find_market()
         if m:
             await q.message.reply_text(
-                "✅ MARKET FOUND\n\nName: %s\n\ncondition_id:\n%s\n\n"
-                "token_id YES:\n%s\n\ntoken_id NO:\n%s\n\n"
-                "Price YES: %.4f\nPrice NO: %.4f\nCloses in: %.0f sec"%(
-                    m["question"][:80],m["condition_id"],m["token_id_yes"],m["token_id_no"],
-                    m["price_yes"],m["price_no"],m["diff_sec"]))
+                "Маркет знайдено\n\n%s\n\ncondition_id:\n%s\n\n"
+                "YES token:\n%s\n\nNO token:\n%s\n\n"
+                "Ціна YES: %.4f | NO: %.4f\nЗакривається через: %.0f сек"%(
+                    m["q"][:80],m["cid"],m["yes_id"],m["no_id"],
+                    m["yes_p"],m["no_p"],m["diff"]))
         else:
-            await q.message.reply_text("❌ MARKET NOT FOUND\nCheck Railway logs")
+            await q.message.reply_text("Маркет не знайдено. Перевір логи Railway.")
 
-    elif q.data=="raw_market":
-        await q.message.reply_text("Checking slugs...")
-        now=time.time(); ROUND=900; prefix="btc-updown-15m-"
-        current=int(now//ROUND)*ROUND; lines=[]
-        for ts in [current-ROUND,current,current+ROUND]:
-            slug="%s%d"%(prefix,ts)
-            try:
-                r=requests.get("https://gamma-api.polymarket.com/events",params={"slug":slug},timeout=15)
-                raw=r.json(); evs=raw if isinstance(raw,list) else [raw] if isinstance(raw,dict) and raw else []
-                if not evs or not evs[0]: lines.append("empty: %s"%slug); continue
-                ev=evs[0]; title=ev.get("title","?"); mkts=ev.get("markets",[]); active=[m for m in mkts if not m.get("closed",True)]
-                lines.append("SLUG: %s"%slug); lines.append("Title: %s"%title[:60])
-                for m in active[:1]:
-                    cid=m.get("conditionId") or m.get("id","?")
-                    lines.append("cid: %s"%str(cid)[:40])
-                    try:
-                        rc=requests.get("https://clob.polymarket.com/markets/%s"%cid,timeout=15)
-                        if rc.status_code==200:
-                            tokens=rc.json().get("tokens",[]); lines.append("CLOB tokens: %d"%len(tokens))
-                            for t in tokens:
-                                oc=t.get("outcome","?"); pr=t.get("price","?"); tid=t.get("token_id") or t.get("tokenId","?")
-                                lines.append("  %s: price=%s tid=%s"%(oc,pr,str(tid)[:20]))
-                        else: lines.append("CLOB HTTP %d"%rc.status_code)
-                    except Exception as e: lines.append("CLOB error: %s"%str(e)[:50])
-                lines.append("")
-            except Exception as e: lines.append("error: %s"%str(e)[:60])
-        await q.message.reply_text("\n".join(lines)[:4000])
-
-    elif q.data=="show_news":
-        await q.message.reply_text("📰 News:\n\n%s"%get_news())
-
-    elif q.data=="show_errors":
-        if not os.path.exists(s.errors_file):
-            await q.message.reply_text("No errors yet."); return
+    elif q.data=="news":
         try:
-            with open(s.errors_file) as f: errs=json.load(f)
-            if not errs: await q.message.reply_text("No errors yet."); return
-            lines=["ERRORS (%d)"%len(errs),""]
+            d=sget("https://min-api.cryptocompare.com/data/v2/news/",{"categories":"BTC,Bitcoin","lTs":0})
+            if d and "Data" in d:
+                bkw=["bull","surge","rally","etf"]; skw=["bear","drop","crash","dump","ban"]
+                lines=[]
+                for item in d["Data"][:5]:
+                    t=item.get("title","").lower(); p=sum(1 for k in bkw if k in t); n=sum(1 for k in skw if k in t)
+                    lines.append("[%s] %s"%("BULLISH" if p>n else "BEARISH" if n>p else "NEUTRAL",item.get("title","")[:70]))
+                await q.message.reply_text("Новини:\n\n"+"\n".join(lines))
+            else: await q.message.reply_text("Новини недоступні.")
+        except Exception: await q.message.reply_text("Помилка завантаження новин.")
+
+    elif q.data=="errors":
+        if not os.path.exists(s.err_file):
+            await q.message.reply_text("Помилок поки немає."); return
+        try:
+            with open(s.err_file) as f: errs=json.load(f)
+            if not errs: await q.message.reply_text("Помилок поки немає."); return
+            lines=["ОСТАННІ ПОМИЛКИ (%d)"%len(errs),""]
             for i,e in enumerate(errs[-5:],1):
-                lines.append("%d. %s %s KEY: %s\n"%(i,e.get("decision","?"),e.get("strength","?"),e.get("key_signal","")[:60]))
+                lines.append("%d. %s %s\n   Сигнал: %s\n"%(i,e.get("dec","?"),e.get("strength","?"),e.get("key_signal","")[:60]))
             await q.message.reply_text("\n".join(lines)[:4000])
-        except Exception: await q.message.reply_text("Error reading file.")
+        except Exception: await q.message.reply_text("Помилка читання файлу.")
 
     elif q.data=="skip":
-        s.pending_trade={}; await q.edit_message_text("Skipped.")
+        s.pending={}; await q.edit_message_text("Скасовано.")
 
-    elif q.data.startswith("execute_"):
+    elif q.data.startswith("exec_"):
         parts=q.data.split("_"); direction=parts[1]; amount=float(parts[2])
-        await q.edit_message_text("⏳ Placing $%.2f..."%amount)
+        await q.edit_message_text("Розміщую ставку $%.2f..."%amount)
         bet=place_bet(s,direction,amount)
-        if bet["success"]:
-            s.trade_history.append({"decision":direction,"amount":amount,"time":datetime.datetime.now(datetime.timezone.utc)})
+        if bet["ok"]:
+            s.trades.append({"dec":direction,"amount":amount,"time":datetime.datetime.now(datetime.timezone.utc)})
             await c.bot.send_message(chat_id=u.effective_chat.id,
-                text="✅ BET OK\n%s | %s\n$%.2f → +$%.2f"%(direction,bet.get("market_name","Polymarket"),amount,bet.get("pot",0)))
+                text="Ставка виконана\n%s | %s\n$%.2f — потенційно +$%.2f"%(
+                    direction,bet.get("mkt","Polymarket"),amount,bet.get("pot",0)))
         else:
-            await c.bot.send_message(chat_id=u.effective_chat.id,text="❌ BET FAILED\n%s"%bet["error"])
-        s.pending_trade={}
+            await c.bot.send_message(chat_id=u.effective_chat.id,text="Ставка не виконана\n%s"%bet["err"])
 
-# ============================================================
-# HANDLE MESSAGE
-# ============================================================
-async def handle_message(u,c):
-    s=get_session(u.effective_user.id); txt=u.message.text.strip()
+# ─────────────────────────────────────────────
+# ТЕКСТОВІ ПОВІДОМЛЕННЯ
+# ─────────────────────────────────────────────
+async def on_message(u,c):
+    s=sess(u.effective_user.id); txt=u.message.text.strip()
 
-    if s.wallet_state=="await_key":
+    # Крок 1: приватний ключ
+    if s.state=="key":
         clean=txt.lower().replace("0x","").replace(" ","")
         if len(clean)!=64:
-            await u.message.reply_text("❌ Wrong length (%d chars, need 64)\n\nGet key:\npolymarket.com → Profile → Export Private Key"%len(clean)); return
-        s.wallet_state=None
-        await u.message.reply_text("⏳ Connecting to Polymarket...")
-        ok,result=connect_wallet(s,txt)
-        if ok:
-            bal,_=get_balance(s); bet=s.calc_bet(bal) if bal else 0.0
-            await u.message.reply_text(
-                "✅ WALLET CONNECTED!\n\n"
-                "📍 %s\n"
-                "💰 Balance: %s\n"
-                "🎯 Stake: $%.2f (10%%)\n\n"
-                "Press 🟢 Auto ON"%(
-                    result,("$%.2f USDC"%bal) if bal else "N/A",bet),
-                reply_markup=kb_main(s))
-        else:
-            await u.message.reply_text("❌ %s\n\nTry again: press 🔗 Connect Wallet"%result,reply_markup=kb_main(s))
+            await u.message.reply_text("Неправильна довжина (%d символів, потрібно 64).\nСпробуй ще раз:"%len(clean))
+            return
+        s.tmp_key=txt; s.state="funder"
+        await u.message.reply_text(
+            "Ключ прийнято.\n\n"
+            "Крок 2/2 — Polymarket адреса\n\n"
+            "Де знайти:\n"
+            "polymarket.com → Deposit → скопіюй адресу\n\n"
+            "Це твоя адреса на Polygon куди поповнюєш баланс.\n\n"
+            "Введи адресу (починається з 0x):")
         return
 
-    if s.pending_trade and time.time()-s.pending_trade.get("timestamp",0)<=600:
+    # Крок 2: funder адреса
+    if s.state=="funder":
+        addr=txt.strip()
+        if not addr.lower().startswith("0x") or len(addr)!=42:
+            await u.message.reply_text("Неправильна адреса. Має бути 42 символи починаючись з 0x.\nСпробуй ще раз:")
+            return
+        s.state=None
+        # Підключаємо
+        key=s.tmp_key or ""
+        s.tmp_key=None
+        clean=key.lower().replace("0x","").replace(" ","")
+        s.key    = "0x" + clean
+        s.funder = addr
+        s.ok     = True
+        try:
+            from eth_account import Account
+            s.address = Account.from_key(s.key).address
+        except Exception:
+            s.address = s.key[:12]+"..."
+        print("[Wallet] key addr=%s funder=%s" % (s.address, s.funder))
+        bal,_=get_balance(s)
+        bet=s.bet_size(bal) if bal else 0.0
+        await u.message.reply_text(
+            "Гаманець підключено!\n\n"
+            "Адреса підписувача: %s\n"
+            "Polymarket funder: %s\n"
+            "Баланс: %s\n"
+            "Ставка: $%.2f (10%%)\n\n"
+            "Тепер натисни «Авто: УВІМК»"%(
+                s.address,addr,
+                ("$%.2f USDC"%bal) if bal is not None else "перевіряємо...",
+                bet),
+            reply_markup=kb(s))
+        return
+
+    # Ручна ставка
+    if hasattr(s,"pending") and s.pending and time.time()-s.pending.get("ts",0)<=600:
         try:
             amount=float(txt)
-            if amount<1 or amount>500: await u.message.reply_text("Amount $1-$500"); return
-            direction=s.pending_trade["direction"]
-            kb=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ $%.2f on %s"%(amount,direction),callback_data="execute_%s_%.2f"%(direction,amount)),
-                InlineKeyboardButton("❌ Cancel",callback_data="skip")]])
-            await u.message.reply_text("Confirm?",reply_markup=kb)
+            if amount<1 or amount>500: await u.message.reply_text("Сума від $1 до $500"); return
+            direction=s.pending["dir"]
+            ikb=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Підтвердити $%.2f на %s"%(amount,direction),
+                    callback_data="exec_%s_%.2f"%(direction,amount)),
+                InlineKeyboardButton("Скасувати",callback_data="skip")]])
+            await u.message.reply_text("Підтвердити?",reply_markup=ikb)
         except ValueError: pass
 
-# ============================================================
-# AUTO TRADE
-# ============================================================
-async def execute_auto_trade(app,s,payload,result):
-    decision=result.get("decision"); strength=result.get("strength","LOW"); logic=result.get("logic","")
-    print("[AUTO TRADE] uid=%d dec=%s str=%s"%(s.uid,decision,strength))
-    if not decision: return
+# ─────────────────────────────────────────────
+# АВТО ТОРГІВЛЯ
+# ─────────────────────────────────────────────
+async def auto_trade(app,s,p,result):
+    dec=result.get("decision"); strength=result.get("strength","LOW"); logic=result.get("logic","")
+    print("[Auto] uid=%d dec=%s str=%s"%(s.uid,dec,strength))
+    if not dec: return
     bal,_=get_balance(s)
     if bal is None:
-        await app.bot.send_message(chat_id=s.uid,text="❌ Cannot read balance. Check Railway logs."); return
+        await app.bot.send_message(chat_id=s.uid,text="Не вдалось отримати баланс. Перевір логи."); return
     if bal<=0:
-        await app.bot.send_message(chat_id=s.uid,text="❌ Balance $0. Top up at polymarket.com → Deposit"); return
-    amount=s.calc_bet(bal)
+        await app.bot.send_message(chat_id=s.uid,text="Баланс $0. Поповни на polymarket.com → Deposit"); return
+    amount=s.bet_size(bal)
     if amount<1:
-        await app.bot.send_message(chat_id=s.uid,text="❌ Stake $%.2f < $1. Top up."%amount); return
-    bet=place_bet(s,decision,amount)
-    if bet["success"]:
-        s.trade_history.append({"decision":decision,"amount":amount,"entry":payload["price"]["current"],"time":datetime.datetime.now(datetime.timezone.utc)})
+        await app.bot.send_message(chat_id=s.uid,text="Ставка $%.2f < $1. Поповни баланс."%amount); return
+    bet=place_bet(s,dec,amount)
+    if bet["ok"]:
+        s.trades.append({"dec":dec,"amount":amount,"entry":p["price"]["cur"],
+                         "time":datetime.datetime.now(datetime.timezone.utc)})
         await app.bot.send_message(chat_id=s.uid,
-            text="✅ AUTO BET\n%s | %s\nBal: $%.2f → Stake: $%.2f (10%%) → +$%.2f\n\n%s"%(
-                decision,bet.get("market_name","Polymarket"),bal,amount,bet.get("pot",0),logic))
-        print("[AUTO TRADE] OK uid=%d amount=%.2f"%(s.uid,amount))
+            text="Авто-ставка виконана\n%s | %s\nБаланс: $%.2f\nСтавка: $%.2f (10%%)\nПотенційно: +$%.2f\n\n%s"%(
+                dec,bet.get("mkt","Polymarket"),bal,amount,bet.get("pot",0),logic))
+        print("[Auto] OK uid=%d amount=%.2f"%(s.uid,amount))
     else:
-        await app.bot.send_message(chat_id=s.uid,text="❌ AUTO FAILED\n%s"%bet["error"])
-        print("[AUTO TRADE] FAIL uid=%d: %s"%(s.uid,bet["error"]))
+        await app.bot.send_message(chat_id=s.uid,text="Авто-ставка не виконана\n%s"%bet["err"])
+        print("[Auto] FAIL uid=%d: %s"%(s.uid,bet["err"]))
 
-# ============================================================
-# MAIN CYCLE
-# ============================================================
-async def run_cycle(app,s):
-    check_signals(s)
-    payload=get_payload(s)
-    if not payload:
-        await app.bot.send_message(chat_id=s.uid,text="❌ Binance data error"); return
-    result=analyze_with_ai(payload,s)
+# ─────────────────────────────────────────────
+# ГОЛОВНИЙ ЦИКЛ
+# ─────────────────────────────────────────────
+async def cycle(app,s):
+    check_outcomes(s)
+    p=payload(s)
+    if not p:
+        await app.bot.send_message(chat_id=s.uid,text="Помилка даних Binance."); return
+    result=analyze(p,s)
     if not result:
-        await app.bot.send_message(chat_id=s.uid,text="❌ AI error"); return
+        await app.bot.send_message(chat_id=s.uid,text="Помилка AI."); return
 
-    decision=result.get("decision","UP"); strength=result.get("strength","LOW")
+    dec=result.get("decision","UP"); strength=result.get("strength","LOW")
     logic=result.get("logic",""); score=result.get("confidence_score",0)
     reasons=result.get("reasons",[]); key_sig=result.get("key_signal","")
-    mkt_cond=result.get("market_condition",payload["context"]["market_condition"])
-    liq=payload["liquidity"]; sw15=liq.get("sweep_15m",{})
-    ctx=payload["context"]; amd=payload["amd"]; manip=payload["manipulation"]
+    mkt_cond=result.get("market_condition",p["ctx"]["reg"])
+    ad=p["amd"]; mn=p["manip"]; sw15=p["liq"].get("sw15",{})
 
-    sig={"decision":decision,"strength":strength,"confidence_score":score,"logic":logic,
-         "reasons":reasons,"key_signal":key_sig,"entry_price":payload["price"]["current"],
-         "time":payload["timestamp"],"ts_unix":payload["ts_unix"],"outcome":None,
-         "st15m":payload["structure"]["15m"],"mkt_cond":mkt_cond,"session":ctx["session"],
-         "sweep_type":sw15.get("type","NONE"),"amd_phase":amd.get("phase","NONE"),"trap_type":manip["trap_type"]}
-    s.signal_history.append(sig); s.save_history()
+    sig={"dec":dec,"strength":strength,"confidence_score":score,"logic":logic,
+         "reasons":reasons,"key_signal":key_sig,"entry":p["price"]["cur"],
+         "time":p["ts"],"ts_unix":p["ts_unix"],"outcome":None,
+         "st15m":p["struct"]["15m"],"mkt_cond":mkt_cond,"session":p["ctx"]["sess"],
+         "sweep_type":sw15.get("type","NONE"),"amd_phase":ad.get("phase","NONE"),"trap":mn["trap"]}
+    s.signals.append(sig); s.save()
 
     try:
         dump=[]
-        if os.path.exists(SIGNALS_DUMP):
-            with open(SIGNALS_DUMP) as f: dump=json.load(f)
+        if os.path.exists(DUMP_FILE):
+            with open(DUMP_FILE) as f: dump=json.load(f)
         dump.append(sig); dump=dump[-2000:]
-        with open(SIGNALS_DUMP,"w") as f: json.dump(dump,f,ensure_ascii=False,indent=2)
+        with open(DUMP_FILE,"w") as f: json.dump(dump,f,ensure_ascii=False,indent=2)
     except Exception: pass
 
-    str_ua={"HIGH":"🔴 STRONG","MEDIUM":"🟡 MEDIUM","LOW":"🟢 WEAK"}.get(strength,strength)
-    reas_s="\n".join("• "+r for r in reasons[:3]) if reasons else ""
-    main_txt=("📊 SIGNAL\n\n%s | %s | Score:%+d\n$%.2f | %s | %s\n\n🎯 %s\n\n%s\n\n%s")%(
-        "UP ↑" if decision=="UP" else "DOWN ↓",str_ua,score,
-        payload["price"]["current"],mkt_cond,ctx["session"],key_sig,logic,reas_s)
+    str_ua={"HIGH":"STRONG","MEDIUM":"MEDIUM","LOW":"WEAK"}.get(strength,strength)
+    reas_s="\n".join("— "+r for r in reasons[:3]) if reasons else ""
+    main_txt=("СИГНАЛ\n\n%s | %s | Score:%+d\n$%.2f | %s | %s\n\n%s\n\n%s\n\n%s")%(
+        "UP" if dec=="UP" else "DOWN",str_ua,score,
+        p["price"]["cur"],mkt_cond,p["ctx"]["sess"],key_sig,logic,reas_s)
 
-    print("[RUN_CYCLE] uid=%d auto=%s dec=%s str=%s"%(s.uid,s.auto_active,decision,strength))
+    print("[Cycle] uid=%d auto=%s dec=%s str=%s"%(s.uid,s.auto,dec,strength))
 
-    if s.auto_active:
-        await app.bot.send_message(chat_id=s.uid,text="🤖 AUTO SIGNAL\n\n"+main_txt)
-        await execute_auto_trade(app,s,payload,result)
+    if s.auto:
+        await app.bot.send_message(chat_id=s.uid,text="АВТО СИГНАЛ\n\n"+main_txt)
+        await auto_trade(app,s,p,result)
     else:
-        s.pending_trade={"direction":decision,"timestamp":time.time(),"price":payload["price"]["current"]}
-        bal,_=get_balance(s); bet=s.calc_bet(bal) if bal else 0.0
-        kb=InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Yes",callback_data="confirm_%s"%decision),
-            InlineKeyboardButton("❌ No",callback_data="skip")]])
-        hint=(" (recommended $%.2f = 10%%)"%bet) if bal else ""
-        await app.bot.send_message(chat_id=s.uid,text=main_txt+"\n\nEnter USDC amount"+hint+":",reply_markup=kb)
+        if not hasattr(s,"pending"): s.pending={}
+        s.pending={"dir":dec,"ts":time.time(),"price":p["price"]["cur"]}
+        bal,_=get_balance(s); bet=s.bet_size(bal) if bal else 0.0
+        ikb=InlineKeyboardMarkup([[
+            InlineKeyboardButton("Так",callback_data="confirm_%s"%dec),
+            InlineKeyboardButton("Ні",callback_data="skip")]])
+        hint=(" (рекомендовано $%.2f = 10%%)"%bet) if bal else ""
+        await app.bot.send_message(chat_id=s.uid,
+            text=main_txt+"\n\nВведи суму USDC"+hint+":",reply_markup=ikb)
 
-# ============================================================
-# SCHEDULER + MAIN
-# ============================================================
-async def periodic(app):
+# ─────────────────────────────────────────────
+# ПЛАНУВАЛЬНИК
+# ─────────────────────────────────────────────
+async def scheduler(app):
     while True:
         now=datetime.datetime.now(datetime.timezone.utc)
         m2n=15-(now.minute%15)
         if m2n==15: m2n=0
-        next_run=now.replace(second=2,microsecond=0)+datetime.timedelta(minutes=m2n)
-        if next_run<=now: next_run+=datetime.timedelta(minutes=15)
-        wait=(next_run-now).total_seconds()
-        logger.info("Next cycle in %.0fs at %s UTC",wait,next_run.strftime("%H:%M"))
+        nxt=now.replace(second=2,microsecond=0)+datetime.timedelta(minutes=m2n)
+        if nxt<=now: nxt+=datetime.timedelta(minutes=15)
+        wait=(nxt-now).total_seconds()
+        log.info("Наступний цикл через %.0fs о %s UTC",wait,nxt.strftime("%H:%M"))
         await asyncio.sleep(wait)
-        await asyncio.sleep(5)
+        await asyncio.sleep(5)  # чекаємо щоб маркет з'явився
         if _sessions:
             for uid,s in list(_sessions.items()):
-                try: await run_cycle(app,s)
-                except Exception as e: logger.error("Cycle uid=%d: %s",uid,e)
+                try: await cycle(app,s)
+                except Exception as e: log.error("Цикл uid=%d: %s",uid,e)
 
+# ─────────────────────────────────────────────
+# ЗАПУСК
+# ─────────────────────────────────────────────
 def main():
     app=Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    for cmd,fn in [("start",cmd_start),("help",cmd_help),("analyze",cmd_analyze),
-                   ("autoon",cmd_autoon),("autooff",cmd_autooff),("balance",cmd_balance),
-                   ("stats",cmd_stats)]:
+    for cmd,fn in [("start",cmd_start),("stats",cmd_stats),
+                   ("analyze",cmd_analyze),("autoon",cmd_autoon),("autooff",cmd_autooff)]:
         app.add_handler(CommandHandler(cmd,fn))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    async def on_startup(app):
-        asyncio.create_task(periodic(app))
-        logger.info("Bot started. Magic.Link. 10%% bet.")
-    app.post_init=on_startup
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+
+    async def startup(app):
+        asyncio.create_task(scheduler(app))
+        log.info("Бот запущено. Magic.Link. signature_type=1. funder окремо від ключа.")
+
+    app.post_init=startup
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__=="__main__":
     main()
