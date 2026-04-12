@@ -13,9 +13,6 @@ OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
 OI_CACHE  = "oi_cache.json"
 DUMP_FILE = "signals_dump.json"
 
-# Адреса USDC контракту на Polygon (потрібна для balance-allowance)
-USDC_ADDRESS = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
-
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
@@ -36,7 +33,7 @@ class Session:
         self.tmp_key = None
         self.hist    = "hist_%d.json" % uid
         self.err_f   = "err_%d.json"  % uid
-        self._creds  = None
+        self._client = None   # кешований ClobClient (один на сесію)
         self._load()
 
     def _load(self):
@@ -64,8 +61,8 @@ class Session:
         if not bal or bal <= 0: return 0.0
         return round(max(1.0, min(bal * 0.10, 500.0)), 2)
 
-    def invalidate_creds(self):
-        self._creds = None
+    def reset_client(self):
+        self._client = None
 
 _sessions = {}
 def sess(uid):
@@ -73,12 +70,15 @@ def sess(uid):
     return _sessions[uid]
 
 # ─────────────────────────────────────────────
-# L2 CREDENTIALS — отримуємо один раз і кешуємо
+# ОДИН КЛІЄНТ НА СЕСІЮ
+# Ключова ідея: створюємо ClobClient ОДИН РАЗ,
+# викликаємо set_api_creds на ньому ж — і зберігаємо.
+# Баланс і ордери через той самий об'єкт.
 # ─────────────────────────────────────────────
-def get_or_cache_creds(s):
-    if s._creds:
-        return s._creds
-    print("[Creds] Отримуємо L2 креди...")
+def get_client(s):
+    if s._client is not None:
+        return s._client
+    print("[Client] Ініціалізуємо ClobClient...")
     from py_clob_client.client import ClobClient
     from py_clob_client.constants import POLYGON
     client = ClobClient(
@@ -89,79 +89,42 @@ def get_or_cache_creds(s):
         funder         = s.funder,
     )
     creds = client.create_or_derive_api_creds()
-    if isinstance(creds, dict):
-        s._creds = creds
-    else:
-        s._creds = {
-            "apiKey":     getattr(creds, "api_key", ""),
-            "secret":     getattr(creds, "api_secret", ""),
-            "passphrase": getattr(creds, "api_passphrase", ""),
-        }
-    print("[Creds] OK key=%s..." % s._creds.get("apiKey","")[:12])
-    return s._creds
+    client.set_api_creds(creds)
+    s._client = client
+    api_key = getattr(creds, "api_key", None) or (creds.get("apiKey","") if isinstance(creds,dict) else "")
+    print("[Client] OK key=%s..." % str(api_key)[:12])
+    return client
 
 # ─────────────────────────────────────────────
-# HMAC підпис
-# ─────────────────────────────────────────────
-def make_hmac_headers(creds: dict, method: str, path: str, address: str) -> dict:
-    api_key    = creds.get("apiKey") or creds.get("api_key", "")
-    secret     = creds.get("secret", "")
-    passphrase = creds.get("passphrase", "")
-    ts         = str(int(time.time()))
-    try:
-        pad = 4 - len(secret) % 4
-        secret_bytes = base64.urlsafe_b64decode(secret + "=" * pad)
-    except Exception:
-        secret_bytes = secret.encode("utf-8")
-    message   = ts + method.upper() + path
-    signature = base64.urlsafe_b64encode(
-        hmac.new(secret_bytes, message.encode("utf-8"), hashlib.sha256).digest()
-    ).decode("utf-8")
-    return {
-        "POLY_ADDRESS":    address,
-        "POLY_SIGNATURE":  signature,
-        "POLY_TIMESTAMP":  ts,
-        "POLY_API_KEY":    api_key,
-        "POLY_PASSPHRASE": passphrase,
-        "Content-Type":    "application/json",
-    }
-
-# ─────────────────────────────────────────────
-# БАЛАНС
-# asset_type треба передавати як адресу контракту USDC
+# БАЛАНС через py-clob-client
+# asset_type="COLLATERAL" — це правильний рядок для USDC
 # ─────────────────────────────────────────────
 def get_balance(s):
     if not s.ok or not s.key:
         return None, "Гаманець не підключено"
     try:
-        creds   = get_or_cache_creds(s)
-        address = s.address or s.funder
-        headers = make_hmac_headers(creds, "GET", "/balance-allowance", address)
+        from py_clob_client.clob_types import AssetType
+        client = get_client(s)
+        resp   = client.get_balance_allowance(params={"asset_type": AssetType.COLLATERAL})
+        print("[Balance] raw: %s" % str(resp)[:200])
 
-        r = requests.get(
-            "https://clob.polymarket.com/balance-allowance",
-            params={"asset_type": USDC_ADDRESS},
-            headers=headers,
-            timeout=15,
-        )
-        print("[Balance] HTTP %d: %s" % (r.status_code, r.text[:200]))
-
-        if r.status_code == 200:
-            data    = r.json()
-            raw_val = float(data.get("balance") or data.get("usdc_balance") or 0)
-            bal = raw_val / 1e6 if raw_val > 1000 else raw_val
-            print("[Balance] $%.2f" % round(bal, 2))
-            return round(bal, 2), s.funder
-        elif r.status_code in (401, 403):
-            s.invalidate_creds()
-            return 0.0, "Помилка авторизації (%d)" % r.status_code
+        # resp може бути dict або об'єкт
+        if isinstance(resp, dict):
+            raw_val = float(resp.get("balance") or resp.get("usdc_balance") or 0)
         else:
-            return 0.0, "HTTP %d: %s" % (r.status_code, r.text[:80])
+            raw_val = float(getattr(resp, "balance", 0) or 0)
+
+        bal = raw_val / 1e6 if raw_val > 1000 else raw_val
+        print("[Balance] $%.2f" % round(bal, 2))
+        return round(bal, 2), s.funder
 
     except Exception as e:
         err = str(e)
         print("[Balance] Error: %s" % err)
-        return 0.0, err[:100]
+        if any(x in err.lower() for x in ["unauthorized","401","forbidden","invalid"]):
+            s.reset_client()
+            print("[Balance] Скинули клієнт, наступний виклик створить новий")
+        return 0.0, err[:120]
 
 # ─────────────────────────────────────────────
 # ПОШУК МАРКЕТУ
@@ -241,7 +204,7 @@ def find_market():
     print("[Market] НЕ ЗНАЙДЕНО"); return None
 
 # ─────────────────────────────────────────────
-# СТАВКА
+# СТАВКА — через той самий клієнт
 # ─────────────────────────────────────────────
 def place_bet(s, direction: str, amount: float) -> dict:
     if not s.ok:   return {"ok":False,"err":"Гаманець не підключено"}
@@ -266,31 +229,15 @@ def place_bet(s, direction: str, amount: float) -> dict:
     print("[Bet] dir=%s price=%.4f size=%.2f usdc=%.2f" % (direction, price, size, amount))
 
     try:
-        from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import OrderArgs, OrderType, Side, ApiCreds
-        from py_clob_client.constants import POLYGON
+        from py_clob_client.clob_types import OrderArgs, OrderType
+        from py_clob_client.order_builder.constants import BUY
 
-        raw_creds = get_or_cache_creds(s)
-        api_creds = ApiCreds(
-            api_key        = raw_creds.get("apiKey") or raw_creds.get("api_key", ""),
-            api_secret     = raw_creds.get("secret", ""),
-            api_passphrase = raw_creds.get("passphrase", ""),
-        )
-        client = ClobClient(
-            host           = "https://clob.polymarket.com",
-            key            = s.key,
-            chain_id       = POLYGON,
-            signature_type = 1,
-            funder         = s.funder,
-            creds          = api_creds,
-        )
-        client.set_api_creds(api_creds)
-
-        order = client.create_order(OrderArgs(
+        client = get_client(s)
+        order  = client.create_order(OrderArgs(
             token_id = token_id,
             price    = price,
             size     = size,
-            side     = Side.BUY,
+            side     = BUY,
         ))
         resp = client.post_order(order, OrderType.GTC)
         print("[Bet] OK: %s" % str(resp)[:100])
@@ -300,7 +247,7 @@ def place_bet(s, direction: str, amount: float) -> dict:
         err = str(e)
         print("[Bet] FAIL: %s" % err)
         if any(x in err.lower() for x in ["unauthorized","401","forbidden","invalid api key"]):
-            s.invalidate_creds()
+            s.reset_client()
         if "not enough" in err.lower() or "allowance" in err.lower():
             return {"ok":False,"err":"Недостатньо USDC на Polymarket"}
         return {"ok":False,"err":err[:200]}
@@ -787,7 +734,7 @@ async def on_message(u,c):
         s.state=None; key=s.tmp_key or ""; s.tmp_key=None
         clean=key.lower().replace("0x","").replace(" ","")
         s.key="0x"+clean; s.funder=addr; s.ok=True
-        s._creds=None
+        s._client=None  # скидаємо клієнт при новому підключенні
         try:
             from eth_account import Account
             s.address=Account.from_key(s.key).address
@@ -817,7 +764,6 @@ async def on_message(u,c):
 # ─────────────────────────────────────────────
 async def auto_trade(app,s,p,result):
     dec=result.get("decision"); strength=result.get("strength","LOW"); logic=result.get("logic","")
-    print("[Auto] uid=%d dec=%s str=%s"%(s.uid,dec,strength))
     if not dec: return
     bal,err=get_balance(s)
     if not bal or bal<=0:
@@ -922,7 +868,7 @@ def main():
 
     async def startup(app):
         asyncio.create_task(scheduler(app))
-        log.info("Бот запущено. Magic.Link. signature_type=1. USDC address fix.")
+        log.info("Бот запущено. Magic.Link. signature_type=1. Single client instance.")
 
     app.post_init=startup
     app.run_polling(allowed_updates=Update.ALL_TYPES,drop_pending_updates=True)
