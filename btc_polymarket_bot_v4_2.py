@@ -7,6 +7,7 @@ import asyncio, logging, json, time, datetime, os, io, requests, hmac, hashlib, 
 from openai import OpenAI
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters
+from py_clob_client.clob_types import SignatureType
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
@@ -85,7 +86,7 @@ def get_l2_creds(s):
         host           = "https://clob.polymarket.com",
         key            = s.key,
         chain_id       = POLYGON,
-        signature_type = 1,
+        signature_type = SignatureType.POLY_PROXY,
         funder         = s.funder,
     )
     creds = client.create_or_derive_api_creds()
@@ -129,7 +130,7 @@ def build_clob_client(s, with_creds=True):
             host           = "https://clob.polymarket.com",
             key            = s.key,
             chain_id       = POLYGON,
-            signature_type = 1,
+           signature_type = SignatureType.POLY_PROXY,
             funder         = s.funder,
             creds          = api_creds,
         )
@@ -139,7 +140,7 @@ def build_clob_client(s, with_creds=True):
             host           = "https://clob.polymarket.com",
             key            = s.key,
             chain_id       = POLYGON,
-            signature_type = 1,
+            signature_type = SignatureType.POLY_PROXY,
             funder         = s.funder,
         )
     return client
