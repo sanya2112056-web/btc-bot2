@@ -92,41 +92,82 @@ def connect_wallet(s, private_key: str):
 # BALANCE — прямий HTTP без py-clob-client
 # ============================================================
 def get_balance(s):
+    """
+    Читає баланс з Polymarket.
+    /balance-allowance потребує API key credentials, не L1 підпис напряму.
+    Тому: спочатку отримуємо API key через L1, потім читаємо баланс через API key.
+    """
     if not s.wallet_ok:
         return None, "Wallet not connected"
     try:
         from eth_account import Account
         from eth_account.messages import encode_defunct
+
         key     = s.private_key
         account = Account.from_key(key)
         address = account.address
         s.wallet_address = address
 
-        ts  = str(int(time.time()))
-        msg = encode_defunct(text=ts + "GET" + "/balance-allowance")
-        sig = "0x" + account.sign_message(msg).signature.hex()
+        def l1_headers(method, path, body=""):
+            ts  = str(int(time.time()))
+            msg = encode_defunct(text=ts + method + path + body)
+            sig = "0x" + account.sign_message(msg).signature.hex()
+            return {"POLY_ADDRESS":address,"POLY_SIGNATURE":sig,
+                    "POLY_TIMESTAMP":ts,"POLY_NONCE":"0","Content-Type":"application/json"}
 
-        r = requests.get(
-            "https://clob.polymarket.com/balance-allowance",
-            params={"asset_type": "USDC"},
-            headers={"POLY_ADDRESS":address,"POLY_SIGNATURE":sig,
-                     "POLY_TIMESTAMP":ts,"POLY_NONCE":"0"},
-            timeout=15)
-        print("[Balance] HTTP %d: %s" % (r.status_code, r.text[:100]))
+        # Крок 1: отримуємо API key через L1
+        r = requests.get("https://clob.polymarket.com/auth/api-key",
+                         headers=l1_headers("GET","/auth/api-key"), timeout=15)
+        print("[Balance] auth HTTP %d: %s" % (r.status_code, r.text[:80]))
+
         if r.status_code == 200:
-            data = r.json()
+            cr = r.json()
+        else:
+            # Створюємо новий API key
+            r2 = requests.post("https://clob.polymarket.com/auth/api-key",
+                               headers=l1_headers("POST","/auth/api-key"), timeout=15)
+            print("[Balance] create key HTTP %d: %s" % (r2.status_code, r2.text[:80]))
+            if r2.status_code not in (200,201):
+                print("[Balance] Cannot get API key")
+                return 0.0, address
+            cr = r2.json()
+
+        api_key = cr.get("apiKey") or cr.get("api_key","")
+        secret  = cr.get("secret","")
+        passph  = cr.get("passphrase","")
+        print("[Balance] Got API key: %s..." % api_key[:12])
+
+        # Крок 2: читаємо баланс з API key
+        import hmac as _h, hashlib, base64
+        ts2     = str(int(time.time()))
+        path2   = "/balance-allowance?asset_type=USDC"
+        sign_s  = ts2 + "GET" + path2
+        asig    = base64.b64encode(_h.new(secret.encode(), sign_s.encode(), hashlib.sha256).digest()).decode()
+
+        rb = requests.get(
+            "https://clob.polymarket.com/balance-allowance",
+            params={"asset_type":"USDC"},
+            headers={"POLY-API-KEY":api_key,"POLY-SIGNATURE":asig,
+                     "POLY-TIMESTAMP":ts2,"POLY-PASSPHRASE":passph},
+            timeout=15)
+        print("[Balance] balance HTTP %d: %s" % (rb.status_code, rb.text[:100]))
+
+        if rb.status_code == 200:
+            data = rb.json()
             raw  = float(data.get("balance") or 0)
+            # Polymarket зберігає в мікро-USDC (6 decimals)
             bal  = raw / 1e6 if raw > 1000 else raw
-            print("[Balance] $%.2f" % round(bal, 2))
-            return round(bal, 2), address
+            bal  = round(bal, 2)
+            print("[Balance] $%.2f" % bal)
+            return bal, address
+
         return 0.0, address
+
     except Exception as e:
-        print("[Balance] Error: %s" % e)
+        print("[Balance] Exception: %s" % e)
         return 0.0, s.wallet_address or "error"
 
-# ============================================================
-# PLACE BET
-# ============================================================
+
 def place_bet(s, direction: str, amount: float) -> dict:
     if not s.wallet_ok:
         return {"success":False,"error":"Wallet not connected"}
