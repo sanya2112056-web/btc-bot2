@@ -109,150 +109,107 @@ def connect_wallet(s, private_key: str):
 # BALANCE — через CLOB API
 # ============================================================
 def get_balance(s):
+    """
+    Читає баланс USDC з Polymarket акаунту через кілька методів.
+    """
     if not s.wallet_ok:
         return None, "Wallet not connected"
+
+    key = s.private_key.strip()
+    if not key.startswith("0x"): key = "0x" + key
+
+    # Метод 1: py-clob-client get_balance_allowance
     try:
         from py_clob_client.client import ClobClient
         from py_clob_client.constants import POLYGON
-        key = s.private_key
         client = ClobClient(host="https://clob.polymarket.com",
                             key=key, chain_id=POLYGON, signature_type=0)
         try:    creds = client.derive_api_key()
         except: creds = client.create_api_key()
         client.set_api_creds(creds)
-        info = client.get_balance_allowance(params={"asset_type": "USDC"})
-        bal  = round(float(info.get("balance", 0)) / 1e6, 2)
-        return bal, s.wallet_address or "Polymarket"
-    except ImportError:
-        pass
-    except Exception as e:
-        print("[Balance] CLOB error: %s" % e)
 
-    # Fallback: Polygon RPC
+        # Пробуємо різні формати
+        for asset_type in ["USDC", "usdc", "collateral"]:
+            try:
+                info = client.get_balance_allowance(params={"asset_type": asset_type})
+                print("[Balance] raw response (%s): %s" % (asset_type, str(info)[:100]))
+                # Polymarket повертає баланс в мікро-USDC (1e6) або вже в USDC
+                raw = info.get("balance") or info.get("usdc_balance") or 0
+                bal = float(raw)
+                # Якщо занадто велике число — ділимо на 1e6
+                if bal > 10000:
+                    bal = bal / 1e6
+                bal = round(bal, 2)
+                if bal >= 0:
+                    print("[Balance] Method 1 OK: $%.2f" % bal)
+                    return bal, s.wallet_address or "Polymarket"
+            except Exception as e:
+                print("[Balance] asset_type=%s error: %s" % (asset_type, e))
+    except ImportError:
+        print("[Balance] py-clob-client not installed")
+    except Exception as e:
+        print("[Balance] CLOB client error: %s" % e)
+
+    # Метод 2: прямий HTTP запит до CLOB API
     try:
         from eth_account import Account
-        addr = Account.from_key(s.private_key).address
-        s.wallet_address = addr
-        for usdc in ["0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
-                     "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"]:
-            data    = "0x70a08231000000000000000000000000" + addr[2:].lower()
-            payload = {"jsonrpc":"2.0","method":"eth_call",
-                       "params":[{"to":usdc,"data":data},"latest"],"id":1}
-            for rpc in ["https://polygon-rpc.com","https://polygon.drpc.org"]:
-                try:
-                    r   = requests.post(rpc, json=payload, timeout=10)
-                    res = r.json().get("result","")
-                    if res and res not in ("0x","0x0",""):
-                        bal = round(int(res,16)/1e6, 2)
-                        if bal > 0: return bal, addr
-                except Exception: continue
-        return 0.0, addr
+        from eth_account.messages import encode_defunct
+        account = Account.from_key(key)
+        address = account.address
+        s.wallet_address = address
+
+        ts      = str(int(time.time()))
+        message = ts + "GET" + "/balance-allowance"
+        msg     = encode_defunct(text=message)
+        sig     = "0x" + account.sign_message(msg).signature.hex()
+
+        r = requests.get(
+            "https://clob.polymarket.com/balance-allowance",
+            params={"asset_type": "USDC"},
+            headers={
+                "POLY_ADDRESS":   address,
+                "POLY_SIGNATURE": sig,
+                "POLY_TIMESTAMP": ts,
+                "POLY_NONCE":     "0",
+            },
+            timeout=15)
+
+        print("[Balance] HTTP balance-allowance: %d %s" % (r.status_code, r.text[:80]))
+
+        if r.status_code == 200:
+            data = r.json()
+            raw  = float(data.get("balance") or data.get("usdc_balance") or 0)
+            bal  = raw / 1e6 if raw > 10000 else raw
+            bal  = round(bal, 2)
+            print("[Balance] Method 2 OK: $%.2f" % bal)
+            return bal, address
+
     except Exception as e:
-        return None, str(e)
+        print("[Balance] Method 2 error: %s" % e)
 
-# ============================================================
-# POLYMARKET MARKET FINDER
-# ============================================================
-def find_btc_market():
-    """
-    Знаходить поточний раунд "Bitcoin Up or Down - 15 min"
-    через slug: btc-updown-15m-{timestamp}
-    Токени беремо через CLOB по condition_id.
-    """
-    SLUG_PREFIX = "btc-updown-15m-"
-    ROUND_SEC   = 900
+    # Метод 3: Gamma API профіль
+    try:
+        from eth_account import Account
+        address = Account.from_key(key).address
+        r = requests.get(
+            "https://gamma-api.polymarket.com/user-positions",
+            params={"user": address},
+            timeout=15)
+        print("[Balance] Gamma positions: %d %s" % (r.status_code, r.text[:80]))
+        if r.status_code == 200:
+            data = r.json()
+            bal  = float(data.get("usdc_balance") or data.get("balance") or 0)
+            if bal > 10000: bal = bal / 1e6
+            return round(bal, 2), address
+    except Exception as e:
+        print("[Balance] Method 3 error: %s" % e)
 
-    def parse_end(m):
-        for f in ("end_date_iso","endDate","endDateIso","end_time","endTime","end_date"):
-            v = m.get(f)
-            if not v: continue
-            try:
-                return float(datetime.datetime.fromisoformat(
-                    str(v).replace("Z","+00:00")).timestamp())
-            except Exception:
-                try: return float(v)
-                except Exception: pass
-        return None
+    # Якщо всі методи не дали баланс — повертаємо 0 але не None
+    # щоб бот не зупинявся
+    print("[Balance] All methods failed, returning 0")
+    return 0.0, s.wallet_address or "Polymarket"
 
-    def get_tokens(cid):
-        try:
-            r = requests.get("https://clob.polymarket.com/markets/%s" % cid, timeout=15)
-            if r.status_code != 200: return None, None, 0.5, 0.5
-            tokens = r.json().get("tokens", [])
-            ty_id = tn_id = ""
-            ty_pr = tn_pr = 0.5
-            for t in tokens:
-                oc  = (t.get("outcome") or "").upper().strip()
-                tid = (t.get("token_id") or t.get("tokenId") or "").strip()
-                pr  = float(t.get("price", 0.5) or 0.5)
-                if oc in ("YES","UP","HIGHER","ABOVE"): ty_id=tid; ty_pr=pr
-                elif oc in ("NO","DOWN","LOWER","BELOW"): tn_id=tid; tn_pr=pr
-            if not ty_id and tokens:
-                ty_id = (tokens[0].get("token_id") or tokens[0].get("tokenId") or "").strip()
-                ty_pr = float(tokens[0].get("price",0.5) or 0.5)
-            if not tn_id and len(tokens)>1:
-                tn_id = (tokens[1].get("token_id") or tokens[1].get("tokenId") or "").strip()
-                tn_pr = float(tokens[1].get("price",0.5) or 0.5)
-            return ty_id, tn_id, ty_pr, tn_pr
-        except Exception as e:
-            print("[Market] CLOB token error: %s" % e)
-            return None, None, 0.5, 0.5
 
-    def try_slug(slug, now_ts):
-        try:
-            r = requests.get("https://gamma-api.polymarket.com/events",
-                             params={"slug": slug}, timeout=15)
-            if r.status_code != 200: return None
-            raw    = r.json()
-            events = raw if isinstance(raw,list) else [raw] if (isinstance(raw,dict) and raw) else []
-            if not events: return None
-            ev     = events[0]
-            title  = ev.get("title","") or slug
-            print("[Market] Event: %s" % title[:60])
-            for m in ev.get("markets",[]):
-                if m.get("closed",True): continue
-                cid = (m.get("conditionId") or m.get("condition_id") or m.get("id") or "").strip()
-                if not cid: continue
-                end_ts = parse_end(m)
-                diff   = (end_ts - now_ts) if end_ts else 900.0
-                if diff <= 0: continue
-                ty_id, tn_id, ty_pr, tn_pr = get_tokens(cid)
-                if not ty_id or not tn_id:
-                    print("[Market] No tokens for %s" % cid[:20]); continue
-                q = m.get("question","") or title
-                print("[MARKET] FOUND: %s" % q[:60])
-                print("[TOKENS] YES=%s NO=%s" % (ty_id[:20], tn_id[:20]))
-                return {"condition_id":cid,"token_id_yes":ty_id,"token_id_no":tn_id,
-                        "price_yes":ty_pr,"price_no":tn_pr,"question":q,"diff_sec":round(diff,1)}
-        except Exception as e:
-            print("[Market] slug error: %s" % e)
-        return None
-
-    def scan():
-        now_ts  = time.time()
-        current = int(now_ts // ROUND_SEC) * ROUND_SEC
-        print("[Market] Searching at %s UTC" %
-              datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S"))
-        for ts in [current, current + ROUND_SEC, current - ROUND_SEC]:
-            slug   = "%s%d" % (SLUG_PREFIX, ts)
-            print("[Market] Trying: %s" % slug)
-            result = try_slug(slug, now_ts)
-            if result: return result
-        return None
-
-    for attempt in range(1, 8):
-        print("[Market] Attempt %d/7" % attempt)
-        result = scan()
-        if result: return result
-        if attempt < 7:
-            print("[Market] Retry in 3s...")
-            time.sleep(3)
-    print("[Market] NOT FOUND")
-    return None
-
-# ============================================================
-# PLACE BET — Magic.Link signature_type=0
-# ============================================================
 def place_bet(s, direction: str, amount: float) -> dict:
     """
     Ставка через Polymarket CLOB API.
@@ -976,8 +933,10 @@ async def execute_auto_trade(app,s,payload,result):
     print("[AUTO TRADE] uid=%d dec=%s str=%s"%(s.uid,decision,strength))
     if not decision: return
     bal,_=get_balance(s)
-    if not bal or bal<=0:
-        await app.bot.send_message(chat_id=s.uid,text="❌ No USDC balance on Polymarket. Top up at polymarket.com"); return
+    if bal is None:
+        await app.bot.send_message(chat_id=s.uid,text="❌ Cannot read balance. Check Railway logs."); return
+    if bal <= 0:
+        await app.bot.send_message(chat_id=s.uid,text="❌ Balance $0 on Polymarket. Top up at polymarket.com/portfolio"); return
     amount=s.calc_bet(bal)
     if amount<1:
         await app.bot.send_message(chat_id=s.uid,text="❌ Stake $%.2f < $1. Top up."%amount); return
