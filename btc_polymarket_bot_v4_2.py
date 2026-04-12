@@ -75,34 +75,38 @@ def sess(uid):
 # БАЛАНС через Builder API Keys
 # ─────────────────────────────────────────────
 def get_balance(s):
-    if not POLY_API_KEY or not POLY_SECRET:
-        return 0.0, "Додай POLY_API_KEY в Railway Variables"
+    """
+    Баланс через py-clob-client з приватним ключем.
+    Builder Keys НЕ підходять для балансу — потрібні L2 creds від приватного ключа.
+    """
+    if not s.ok or not s.key:
+        return 0.0, "Гаманець не підключено"
     try:
-        import hmac as _h, hashlib, base64
-        ts   = str(int(time.time()))
-        path = "/balance-allowance?asset_type=USDC"
-        sig  = base64.b64encode(
-            _h.new(POLY_SECRET.encode(), (ts+"GET"+path).encode(), hashlib.sha256).digest()
-        ).decode()
-        r = requests.get("https://clob.polymarket.com/balance-allowance",
-            params={"asset_type": "USDC"},
-            headers={"POLY-API-KEY": POLY_API_KEY, "POLY-SIGNATURE": sig,
-                     "POLY-TIMESTAMP": ts, "POLY-PASSPHRASE": POLY_PASSPHRASE},
-            timeout=15)
-        print("[Balance] HTTP %d: %s" % (r.status_code, r.text[:100]))
-        if r.status_code == 200:
-            raw = float(r.json().get("balance") or 0)
-            bal = raw / 1e6 if raw > 1000 else raw
-            print("[Balance] $%.2f" % round(bal, 2))
-            return round(bal, 2), s.funder or "Polymarket"
-        return 0.0, s.funder or "error"
+        from py_clob_client.client import ClobClient
+        from py_clob_client.constants import POLYGON
+        client = ClobClient(
+            host           = "https://clob.polymarket.com",
+            key            = s.key,
+            chain_id       = POLYGON,
+            signature_type = 1,
+            funder         = s.funder,
+        )
+        creds = client.create_or_derive_api_creds()
+        client.set_api_creds(creds)
+        info = client.get_balance_allowance(params={"asset_type": "USDC"})
+        print("[Balance] raw: %s" % str(info)[:100])
+        raw = float(info.get("balance") or 0)
+        bal = raw / 1e6 if raw > 1000 else raw
+        print("[Balance] $%.2f" % round(bal, 2))
+        return round(bal, 2), s.funder or "Polymarket"
+    except ImportError:
+        print("[Balance] py-clob-client не встановлено")
+        return 0.0, "py-clob-client not installed"
     except Exception as e:
         print("[Balance] Error: %s" % e)
-        return 0.0, "error"
+        return 0.0, str(e)[:100]
 
-# ─────────────────────────────────────────────
-# ПОШУК МАРКЕТУ через slug
-# ─────────────────────────────────────────────
+
 def find_market():
     SLUG  = "btc-updown-15m-"
     ROUND = 900
