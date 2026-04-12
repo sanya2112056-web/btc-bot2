@@ -97,105 +97,71 @@ def get_creds(client):
 # БАЛАНС
 # ─────────────────────────────────────────────
 def get_balance(s):
+    """
+    Баланс через прямий HTTP з L1 підписом.
+    signature_type=1 Magic.Link: підписуємо від імені signer key,
+    але funder = адреса що тримає USDC.
+    """
     if not s.ok: return None, "Гаманець не підключено"
     try:
-        client = make_client(s)
-        creds  = get_creds(client)
-        client.set_api_creds(creds)
-        info   = client.get_balance_allowance(params={"asset_type": "USDC"})
-        raw    = float(info.get("balance") or 0)
-        bal    = raw / 1e6 if raw > 1000 else raw
-        print("[Balance] raw=%s bal=%.2f" % (raw, bal))
-        return round(bal, 2), s.funder
+        from eth_account import Account
+        from eth_account.messages import encode_defunct
+
+        account = Account.from_key(s.key)
+        signer  = account.address   # адреса підписувача (з приватного ключа)
+        funder  = s.funder          # адреса що тримає USDC
+
+        # L1 підпис: timestamp + method + path
+        ts  = str(int(time.time()))
+        msg = encode_defunct(text=ts + "GET" + "/balance-allowance")
+        sig = "0x" + account.sign_message(msg).signature.hex()
+
+        r = requests.get(
+            "https://clob.polymarket.com/balance-allowance",
+            params={"asset_type": "USDC"},
+            headers={
+                "POLY_ADDRESS":   funder,    # funder — не signer!
+                "POLY_SIGNATURE": sig,
+                "POLY_TIMESTAMP": ts,
+                "POLY_NONCE":     "0",
+            },
+            timeout=15)
+
+        print("[Balance] signer=%s funder=%s" % (signer[:12], funder[:12]))
+        print("[Balance] HTTP %d: %s" % (r.status_code, r.text[:120]))
+
+        if r.status_code == 200:
+            data = r.json()
+            raw  = float(data.get("balance") or 0)
+            bal  = raw / 1e6 if raw > 1000 else raw
+            print("[Balance] $%.2f" % round(bal, 2))
+            return round(bal, 2), funder
+
+        # Fallback: спробуємо з signer адресою
+        r2 = requests.get(
+            "https://clob.polymarket.com/balance-allowance",
+            params={"asset_type": "USDC"},
+            headers={
+                "POLY_ADDRESS":   signer,
+                "POLY_SIGNATURE": sig,
+                "POLY_TIMESTAMP": ts,
+                "POLY_NONCE":     "0",
+            },
+            timeout=15)
+        print("[Balance] Fallback signer HTTP %d: %s" % (r2.status_code, r2.text[:100]))
+        if r2.status_code == 200:
+            data = r2.json()
+            raw  = float(data.get("balance") or 0)
+            bal  = raw / 1e6 if raw > 1000 else raw
+            return round(bal, 2), signer
+
+        return 0.0, funder
+
     except Exception as e:
-        print("[Balance] Error: %s" % e)
+        print("[Balance] Exception: %s" % e)
         return 0.0, s.funder or "error"
 
-# ─────────────────────────────────────────────
-# ПОШУК МАРКЕТУ
-# ─────────────────────────────────────────────
-def find_market():
-    """
-    Знаходить поточний раунд Bitcoin Up or Down - 15 min.
-    Slug: btc-updown-15m-{timestamp кратний 900}
-    Токени: через CLOB /markets/{condition_id}
-    """
-    SLUG = "btc-updown-15m-"
-    ROUND = 900
 
-    def end_ts(m):
-        for f in ("end_date_iso","endDate","endDateIso","end_time","endTime","end_date"):
-            v = m.get(f)
-            if not v: continue
-            try: return float(datetime.datetime.fromisoformat(str(v).replace("Z","+00:00")).timestamp())
-            except Exception:
-                try: return float(v)
-                except Exception: pass
-        return None
-
-    def tokens(cid):
-        try:
-            r = requests.get("https://clob.polymarket.com/markets/%s" % cid, timeout=15)
-            if r.status_code != 200: return None, None, 0.5, 0.5
-            toks = r.json().get("tokens", [])
-            yi = ni = ""; yp = np_ = 0.5
-            for t in toks:
-                oc  = (t.get("outcome") or "").upper()
-                tid = (t.get("token_id") or t.get("tokenId") or "").strip()
-                pr  = float(t.get("price", 0.5) or 0.5)
-                if oc in ("YES","UP","HIGHER","ABOVE"):   yi=tid; yp=pr
-                elif oc in ("NO","DOWN","LOWER","BELOW"): ni=tid; np_=pr
-            if not yi and toks: yi=(toks[0].get("token_id") or toks[0].get("tokenId") or "").strip(); yp=float(toks[0].get("price",0.5) or 0.5)
-            if not ni and len(toks)>1: ni=(toks[1].get("token_id") or toks[1].get("tokenId") or "").strip(); np_=float(toks[1].get("price",0.5) or 0.5)
-            return yi, ni, yp, np_
-        except Exception as e:
-            print("[Market] Tokens err: %s" % e)
-            return None, None, 0.5, 0.5
-
-    def try_slug(slug, now):
-        try:
-            r = requests.get("https://gamma-api.polymarket.com/events",
-                             params={"slug": slug}, timeout=15)
-            if r.status_code != 200: return None
-            raw = r.json()
-            evs = raw if isinstance(raw, list) else ([raw] if isinstance(raw, dict) and raw else [])
-            if not evs: return None
-            ev = evs[0]
-            print("[Market] Event: %s" % (ev.get("title","") or slug)[:60])
-            for m in ev.get("markets", []):
-                if m.get("closed", True): continue
-                cid = (m.get("conditionId") or m.get("condition_id") or m.get("id") or "").strip()
-                if not cid: continue
-                et  = end_ts(m)
-                diff = (et - now) if et else 900.0
-                if diff <= 0: continue
-                yi, ni, yp, np_ = tokens(cid)
-                if not yi or not ni:
-                    print("[Market] No tokens for %s" % cid[:20]); continue
-                q = m.get("question","") or ev.get("title","BTC")
-                print("[Market] ЗНАЙДЕНО: %s" % q[:60])
-                print("[Market] YES=%s NO=%s" % (yi[:20], ni[:20]))
-                return {"cid":cid,"yes_id":yi,"no_id":ni,"yes_p":yp,"no_p":np_,"q":q,"diff":round(diff,1)}
-        except Exception as e:
-            print("[Market] Slug err: %s" % e)
-        return None
-
-    now = time.time()
-    cur = int(now // ROUND) * ROUND
-    for attempt in range(1, 8):
-        print("[Market] Спроба %d/7 | %s UTC" % (attempt, datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S")))
-        for ts in [cur, cur + ROUND, cur - ROUND]:
-            r = try_slug("%s%d" % (SLUG, ts), now)
-            if r: return r
-        if attempt < 7:
-            print("[Market] Не знайдено, повтор через 3с...")
-            time.sleep(3)
-    print("[Market] НЕ ЗНАЙДЕНО")
-    return None
-
-# ─────────────────────────────────────────────
-# РОЗМІЩЕННЯ СТАВКИ
-# ─────────────────────────────────────────────
 def place_bet(s, direction: str, amount: float) -> dict:
     """
     Magic.Link: signature_type=1 + funder адреса.
