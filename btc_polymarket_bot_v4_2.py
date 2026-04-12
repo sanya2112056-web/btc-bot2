@@ -556,7 +556,8 @@ def find_btc_market(verbose=False):
 def place_bet(s, direction: str, amount: float) -> dict:
     """
     Ставка через Polymarket CLOB API.
-    Спочатку py-clob-client, якщо не встановлений — L1 auth напряму.
+    Використовує py-clob-client з signature_type=1 (EOA/MetaMask гаманець).
+    ВАЖЛИВО: гаманець має бути зареєстрований на polymarket.com
     """
     if not s.wallet_ok:
         return {"success": False, "error": "Wallet not connected"}
@@ -575,7 +576,6 @@ def place_bet(s, direction: str, amount: float) -> dict:
     print("[BET] dir=%s token=%s price=%.4f size=%.2f usdc=%.2f" % (
         direction, token_id[:20], price, size, amount))
 
-    # ── Спроба 1: py-clob-client ──
     try:
         from py_clob_client.client import ClobClient
         from py_clob_client.clob_types import OrderArgs, OrderType, Side
@@ -583,153 +583,79 @@ def place_bet(s, direction: str, amount: float) -> dict:
 
         key = s.private_key.strip()
         if not key.startswith("0x"): key = "0x" + key
-        client = ClobClient(host="https://clob.polymarket.com", key=key, chain_id=POLYGON)
-        try:    creds = client.derive_api_key()
-        except: creds = client.create_api_key()
-        client.set_api_creds(creds)
 
+        # signature_type=1 = EOA гаманець (MetaMask)
+        # Спочатку ініціалізуємо без API ключів щоб отримати їх
+        client = ClobClient(
+            host="https://clob.polymarket.com",
+            key=key,
+            chain_id=POLYGON,
+            signature_type=0,  # 0 = Magic.Link (email), 1 = MetaMask
+        )
+
+        # Отримуємо або створюємо API credentials
         try:
-            fresh = float(client.get_midpoint(token_id) or price)
-            if 0.01 <= fresh <= 0.99:
-                price = fresh; size = round(amount / price, 2)
-        except Exception: pass
-
-        order = client.create_order(OrderArgs(
-            token_id=token_id, price=price, size=size, side=Side.BUY))
-        resp = client.post_order(order, OrderType.GTC)
-        print("[BET] py-clob OK")
-        return {"success": True, "order": resp, "price": price,
-                "pot": round(size - amount, 2), "market_name": market["question"][:60]}
-
-    except ImportError:
-        print("[BET] py-clob-client not found, using L1 auth...")
-    except Exception as e:
-        print("[BET] py-clob error: %s" % str(e)[:100])
-
-    # ── Спроба 2: L1 автентифікація (правильний формат Polymarket) ──
-    try:
-        import json as _json
-        import hmac as _hmac
-        import hashlib
-        import base64
-        from eth_account import Account
-        from eth_account.messages import encode_defunct
-
-        key = s.private_key.strip()
-        if not key.startswith("0x"): key = "0x" + key
-        account = Account.from_key(key)
-        address = account.address
-
-        def l1_headers(method, path, body=""):
-            """Правильний L1 підпис: ts + METHOD + path + body"""
-            ts      = str(int(time.time()))
-            message = ts + method.upper() + path + body
-            msg     = encode_defunct(text=message)
-            signed  = account.sign_message(msg)
-            sig     = signed.signature.hex()
-            if not sig.startswith("0x"): sig = "0x" + sig
-            return {
-                "POLY_ADDRESS":   address,
-                "POLY_SIGNATURE": sig,
-                "POLY_TIMESTAMP": ts,
-                "POLY_NONCE":     "0",
-                "Content-Type":   "application/json",
-            }
-
-        # GET api-key (якщо вже є)
-        r = requests.get(
-            "https://clob.polymarket.com/auth/api-key",
-            headers=l1_headers("GET", "/auth/api-key"),
-            timeout=15)
-        print("[BET] GET api-key HTTP %d: %s" % (r.status_code, r.text[:80]))
-
-        if r.status_code == 200:
-            creds = r.json()
-        else:
-            # Створюємо новий
-            r2 = requests.post(
-                "https://clob.polymarket.com/auth/api-key",
-                headers=l1_headers("POST", "/auth/api-key"),
-                timeout=15)
-            print("[BET] POST api-key HTTP %d: %s" % (r2.status_code, r2.text[:80]))
-            if r2.status_code not in (200, 201):
+            creds = client.derive_api_key()
+            print("[BET] derive_api_key OK: %s..." % str(creds)[:50])
+        except Exception as e1:
+            print("[BET] derive_api_key failed: %s" % e1)
+            try:
+                creds = client.create_api_key()
+                print("[BET] create_api_key OK: %s..." % str(creds)[:50])
+            except Exception as e2:
+                print("[BET] create_api_key failed: %s" % e2)
                 return {"success": False,
-                        "error": "Auth failed HTTP%d: %s" % (r2.status_code, r2.text[:150])}
-            creds = r2.json()
+                        "error": "Cannot get API key. Register wallet on polymarket.com first! Error: %s" % str(e2)[:100]}
 
-        api_key = creds.get("apiKey") or creds.get("api_key", "")
-        secret  = creds.get("secret", "")
-        passph  = creds.get("passphrase", "")
-        print("[BET] api_key=%s..." % api_key[:12])
-
-        if not api_key:
-            return {"success": False, "error": "Empty API key received: %s" % str(creds)[:100]}
+        # Встановлюємо credentials і реініціалізуємо з ними
+        client.set_api_creds(creds)
 
         # Оновлюємо ціну
         try:
-            rp = requests.get(
-                "https://clob.polymarket.com/midpoints",
-                params={"token_id": token_id}, timeout=10)
-            if rp.status_code == 200:
-                mid = float(rp.json().get("mid", price))
-                if 0.01 <= mid <= 0.99:
-                    price = mid; size = round(amount / price, 2)
-        except Exception: pass
+            fresh = float(client.get_midpoint(token_id) or price)
+            if 0.01 <= fresh <= 0.99:
+                price = fresh
+                size  = round(amount / price, 2)
+                print("[BET] Fresh price: %.4f" % price)
+        except Exception as ep:
+            print("[BET] Midpoint error: %s" % ep)
 
-        # Підписаний ордер через EIP-712 (спрощена версія для GTC)
-        order_ts = str(int(time.time()))
-        order_body = _json.dumps({
-            "order": {
-                "salt":          str(int(time.time() * 1000)),
-                "maker":         address,
-                "signer":        address,
-                "taker":         "0x0000000000000000000000000000000000000000",
-                "tokenId":       token_id,
-                "makerAmount":   str(int(amount * 1e6)),
-                "takerAmount":   str(int(size * 1e6)),
-                "expiration":    "0",
-                "nonce":         "0",
-                "feeRateBps":    "0",
-                "side":          "BUY",
-                "signatureType": 0,
-                "signature":     "0x",
-            },
-            "orderType": "GTC",
-            "owner":     address,
-        }, separators=(',', ':'))
+        # Розміщуємо ордер
+        order = client.create_order(OrderArgs(
+            token_id=token_id,
+            price=price,
+            size=size,
+            side=Side.BUY,
+        ))
+        resp = client.post_order(order, OrderType.GTC)
+        print("[BET] Order OK: %s" % str(resp)[:100])
 
-        # HMAC для API key auth
-        sign_str = order_ts + "POST" + "/order" + order_body
-        h   = _hmac.new(secret.encode(), sign_str.encode(), hashlib.sha256)
-        sig = base64.b64encode(h.digest()).decode()
+        return {
+            "success":     True,
+            "order":       resp,
+            "price":       price,
+            "pot":         round(size - amount, 2),
+            "market_name": market["question"][:60],
+        }
 
-        ro = requests.post(
-            "https://clob.polymarket.com/order",
-            data=order_body,
-            headers={
-                "POLY-API-KEY":    api_key,
-                "POLY-SIGNATURE":  sig,
-                "POLY-TIMESTAMP":  order_ts,
-                "POLY-PASSPHRASE": passph,
-                "Content-Type":    "application/json",
-            },
-            timeout=20)
-
-        print("[BET] Order HTTP %d: %s" % (ro.status_code, ro.text[:150]))
-
-        if ro.status_code in (200, 201):
-            return {"success": True, "order": ro.json(), "price": price,
-                    "pot": round(size - amount, 2), "market_name": market["question"][:60]}
+    except ImportError:
         return {"success": False,
-                "error": "Order HTTP%d: %s" % (ro.status_code, ro.text[:150])}
-
+                "error": "py-clob-client not installed. Check requirements.txt and redeploy."}
     except Exception as e:
         err = str(e)
-        print("[BET] L1 FAIL: %s" % err)
+        print("[BET] FAIL: %s" % err)
+        if "not registered" in err.lower() or "user not found" in err.lower():
+            return {"success": False,
+                    "error": "Wallet not registered on Polymarket. Go to polymarket.com and sign up first!"}
         if "insufficient" in err.lower():
             return {"success": False, "error": "Insufficient USDC balance"}
         if "allowance" in err.lower() or "approve" in err.lower():
             return {"success": False, "error": "Need approve. Press Approve button"}
+        if "401" in err or "invalid l1" in err.lower():
+            return {"success": False,
+                    "error": "Auth error 401. Register wallet on polymarket.com first, then retry."}
+        if "nonce" in err.lower():
+            return {"success": False, "error": "Nonce error, retry in 10s"}
         return {"success": False, "error": err[:200]}
 
 
