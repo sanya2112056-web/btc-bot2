@@ -33,7 +33,7 @@ class Session:
         self.tmp_key = None
         self.hist    = "hist_%d.json" % uid
         self.err_f   = "err_%d.json"  % uid
-        self._client = None   # кешований ClobClient (один на сесію)
+        self._client = None
         self._load()
 
     def _load(self):
@@ -71,9 +71,6 @@ def sess(uid):
 
 # ─────────────────────────────────────────────
 # ОДИН КЛІЄНТ НА СЕСІЮ
-# Ключова ідея: створюємо ClobClient ОДИН РАЗ,
-# викликаємо set_api_creds на ньому ж — і зберігаємо.
-# Баланс і ордери через той самий об'єкт.
 # ─────────────────────────────────────────────
 def get_client(s):
     if s._client is not None:
@@ -96,34 +93,51 @@ def get_client(s):
     return client
 
 # ─────────────────────────────────────────────
-# БАЛАНС через py-clob-client
-# asset_type="COLLATERAL" — це правильний рядок для USDC
+# БАЛАНС
+# Баг в py-clob-client: get_balance_allowance очікує
+# об'єкт BalanceAllowanceParams, а не dict.
+# Тому створюємо об'єкт правильно.
 # ─────────────────────────────────────────────
 def get_balance(s):
     if not s.ok or not s.key:
         return None, "Гаманець не підключено"
     try:
-        from py_clob_client.clob_types import AssetType
+        from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
         client = get_client(s)
-        resp   = client.get_balance_allowance(params={"asset_type": AssetType.COLLATERAL})
+
+        # Передаємо об'єкт BalanceAllowanceParams, НЕ dict
+        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        resp   = client.get_balance_allowance(params=params)
         print("[Balance] raw: %s" % str(resp)[:200])
 
-        # resp може бути dict або об'єкт
         if isinstance(resp, dict):
             raw_val = float(resp.get("balance") or resp.get("usdc_balance") or 0)
         else:
             raw_val = float(getattr(resp, "balance", 0) or 0)
 
+        # Polymarket повертає мікро-USDC (6 decimals) якщо число > 1000
         bal = raw_val / 1e6 if raw_val > 1000 else raw_val
         print("[Balance] $%.2f" % round(bal, 2))
         return round(bal, 2), s.funder
+
+    except ImportError:
+        # Якщо BalanceAllowanceParams не існує в цій версії — пробуємо без params
+        try:
+            client = get_client(s)
+            resp   = client.get_balance_allowance()
+            print("[Balance] raw (no params): %s" % str(resp)[:200])
+            raw_val = float(resp.get("balance") or 0) if isinstance(resp, dict) else float(getattr(resp,"balance",0) or 0)
+            bal = raw_val / 1e6 if raw_val > 1000 else raw_val
+            return round(bal, 2), s.funder
+        except Exception as e2:
+            print("[Balance] Error (no params): %s" % e2)
+            return 0.0, str(e2)[:120]
 
     except Exception as e:
         err = str(e)
         print("[Balance] Error: %s" % err)
         if any(x in err.lower() for x in ["unauthorized","401","forbidden","invalid"]):
             s.reset_client()
-            print("[Balance] Скинули клієнт, наступний виклик створить новий")
         return 0.0, err[:120]
 
 # ─────────────────────────────────────────────
@@ -204,7 +218,7 @@ def find_market():
     print("[Market] НЕ ЗНАЙДЕНО"); return None
 
 # ─────────────────────────────────────────────
-# СТАВКА — через той самий клієнт
+# СТАВКА
 # ─────────────────────────────────────────────
 def place_bet(s, direction: str, amount: float) -> dict:
     if not s.ok:   return {"ok":False,"err":"Гаманець не підключено"}
@@ -734,7 +748,7 @@ async def on_message(u,c):
         s.state=None; key=s.tmp_key or ""; s.tmp_key=None
         clean=key.lower().replace("0x","").replace(" ","")
         s.key="0x"+clean; s.funder=addr; s.ok=True
-        s._client=None  # скидаємо клієнт при новому підключенні
+        s._client=None
         try:
             from eth_account import Account
             s.address=Account.from_key(s.key).address
@@ -868,7 +882,7 @@ def main():
 
     async def startup(app):
         asyncio.create_task(scheduler(app))
-        log.info("Бот запущено. Magic.Link. signature_type=1. Single client instance.")
+        log.info("Бот запущено. BalanceAllowanceParams fix.")
 
     app.post_init=startup
     app.run_polling(allowed_updates=Update.ALL_TYPES,drop_pending_updates=True)
