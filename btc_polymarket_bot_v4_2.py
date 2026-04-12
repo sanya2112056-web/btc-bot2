@@ -7,7 +7,6 @@ import asyncio, logging, json, time, datetime, os, io, requests, hmac, hashlib, 
 from openai import OpenAI
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters
-from py_clob_client.clob_types import SignatureType
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
@@ -86,7 +85,7 @@ def get_l2_creds(s):
         host           = "https://clob.polymarket.com",
         key            = s.key,
         chain_id       = POLYGON,
-        signature_type = SignatureType.POLY_PROXY,
+        signature_type = 1,
         funder         = s.funder,
     )
     creds = client.create_or_derive_api_creds()
@@ -130,7 +129,7 @@ def build_clob_client(s, with_creds=True):
             host           = "https://clob.polymarket.com",
             key            = s.key,
             chain_id       = POLYGON,
-           signature_type = SignatureType.POLY_PROXY,
+            signature_type = 1,
             funder         = s.funder,
             creds          = api_creds,
         )
@@ -140,7 +139,7 @@ def build_clob_client(s, with_creds=True):
             host           = "https://clob.polymarket.com",
             key            = s.key,
             chain_id       = POLYGON,
-            signature_type = SignatureType.POLY_PROXY,
+            signature_type = 1,
             funder         = s.funder,
         )
     return client
@@ -152,23 +151,41 @@ def get_balance(s):
     if not s.ok or not s.key:
         return None, "Гаманець не підключено"
     try:
-        client = build_clob_client(s, with_creds=True)
-        resp   = client.get_balance_allowance(params={"asset_type": "USDC"})
+        from py_clob_client.client import ClobClient
+        from py_clob_client.constants import POLYGON
+        from py_clob_client.clob_types import ApiCreds
+
+        raw = get_or_cache_creds(s)
+        api_creds = ApiCreds(
+            api_key        = raw.get("apiKey") or raw.get("api_key", ""),
+            api_secret     = raw.get("secret", ""),
+            api_passphrase = raw.get("passphrase", ""),
+        )
+        client = ClobClient(
+            host           = "https://clob.polymarket.com",
+            key            = s.key,
+            chain_id       = POLYGON,
+            signature_type = 1,
+            funder         = s.funder,
+            creds          = api_creds,
+        )
+        client.set_api_creds(api_creds)
+
+        # без params — get_balance_allowance не приймає dict
+        resp = client.get_balance_allowance()
         print("[Balance] raw: %s" % str(resp)[:120])
 
-        raw = float(resp.get("balance") or 0)
-        # Polymarket повертає мікро-USDC (6 decimals) якщо > 1000
-        bal = raw / 1e6 if raw > 1000 else raw
+        raw_val = float(resp.get("balance") or 0)
+        bal = raw_val / 1e6 if raw_val > 1000 else raw_val
         print("[Balance] $%.2f" % round(bal, 2))
         return round(bal, 2), s.funder
 
     except Exception as e:
         err = str(e)
         print("[Balance] Error: %s" % err)
-        # Якщо помилка авторизації — скидаємо кеш кредів
         if any(x in err.lower() for x in ["unauthorized", "401", "forbidden", "invalid"]):
             s.invalidate_creds()
-            print("[Balance] Скинули кеш кредів, спробуй ще раз")
+            print("[Balance] Скинули кеш кредів")
         return 0.0, err[:100]
 
 # ─────────────────────────────────────────────
