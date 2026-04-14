@@ -60,7 +60,7 @@ class Session:
 
     def bet_size(self, bal):
         if not bal or bal <= 0: return 0.0
-        return round(max(5.0, min(bal * 0.13, 500.0)), 2)
+        return round(max(1.0, min(bal * 0.13, 500.0)), 2)
 
     def reset_client(self):
         self._client = None
@@ -71,7 +71,7 @@ def sess(uid):
     return _sessions[uid]
 
 # ─────────────────────────────────────────────
-# CLOB КЛІЄНТ
+# CLOB КЛІЄНТ (один на сесію)
 # ─────────────────────────────────────────────
 def get_client(s):
     if s._client is not None:
@@ -197,7 +197,7 @@ def find_market():
 # ─────────────────────────────────────────────
 def place_bet(s, direction: str, amount: float) -> dict:
     if not s.ok:   return {"ok":False,"err":"Гаманець не підключено"}
-    if amount < 5: return {"ok":False,"err":"Мінімум 5 шерів (вимога Polymarket)"}
+    if amount < 1: return {"ok":False,"err":"Мінімум $1"}
     mkt = find_market()
     if not mkt: return {"ok":False,"err":"Активний маркет не знайдено"}
 
@@ -212,11 +212,6 @@ def place_bet(s, direction: str, amount: float) -> dict:
     except: pass
 
     size = round(amount/price, 2)
-    if size < 5:
-        amount = round(5 * price, 2)
-        size   = 5.0
-        print("[Bet] adjusted to min 5 shares: amount=%.2f" % amount)
-
     print("[Bet] dir=%s price=%.4f size=%.2f usdc=%.2f"%(direction,price,size,amount))
     try:
         from py_clob_client.clob_types import OrderArgs, OrderType
@@ -225,7 +220,7 @@ def place_bet(s, direction: str, amount: float) -> dict:
         order  = client.create_order(OrderArgs(token_id=token_id, price=price, size=size, side=BUY))
         resp   = client.post_order(order, OrderType.GTC)
         print("[Bet] OK: %s" % str(resp)[:100])
-        return {"ok":True,"resp":resp,"price":price,"pot":round(size-amount,2),"mkt":mkt["q"][:60],"amount":amount}
+        return {"ok":True,"resp":resp,"price":price,"pot":round(size-amount,2),"mkt":mkt["q"][:60]}
     except Exception as e:
         err=str(e); print("[Bet] FAIL: %s"%err)
         if any(x in err.lower() for x in ["unauthorized","401","forbidden","invalid api key"]): s.reset_client()
@@ -311,8 +306,7 @@ def get_news():
             for item in d["Data"][:5]:
                 t=item.get("title","").lower()
                 p_=sum(1 for k in bkw if k in t); n=sum(1 for k in skw if k in t)
-                sent="+" if p_>n else "-" if n>p_ else "~"
-                lines.append("[%s] %s"%(sent,item.get("title","")[:70]))
+                lines.append("[%s] %s"%("+" if p_>n else "-" if n>p_ else "~",item.get("title","")[:70]))
             return "\n".join(lines)
     except: pass
     return "Новини недоступні"
@@ -547,7 +541,7 @@ def stats_msg(s):
     wr=round(len(wins)/total*100,1)
     bar_w=int(wr/5); bar="▓"*bar_w+"░"*(20-bar_w)
     lines=[
-        "СТАТИСТИКА",
+        "📊 Статистика",
         "",
         "Всього: %d   Перемог: %d   Поразок: %d" % (total,len(wins),total-len(wins)),
         "Вінрейт: %.1f%%  [%s]" % (wr,bar),
@@ -557,20 +551,20 @@ def stats_msg(s):
         sub=[g for g in checked if g.get("strength")==st]
         if sub:
             w=len([g for g in sub if g["outcome"]=="WIN"])
-            lines.append("%s: %d/%d (%.1f%%)"%(label,w,len(sub),round(w/len(sub)*100,1)))
+            lines.append("%s: %d/%d (%.1f%%)" % (label,w,len(sub),round(w/len(sub)*100,1)))
     return "\n".join(lines)
 
 # ─────────────────────────────────────────────
 # ПОВІДОМЛЕННЯ
 # ─────────────────────────────────────────────
 def signal_msg(dec, strength, score, price, mkt_cond, sess_name, key_sig, logic, reasons):
-    direction = "UP ▲" if dec=="UP" else "DOWN ▼"
-    str_label = {"HIGH":"HIGH","MEDIUM":"MEDIUM","LOW":"LOW"}.get(strength,strength)
-    reas_s = "\n".join("  " + r for r in reasons[:3]) if reasons else ""
+    direction = "🟢 UP" if dec=="UP" else "🔴 DOWN"
+    str_label = {"HIGH":"HIGH ●","MEDIUM":"MEDIUM ●","LOW":"LOW ●"}.get(strength,strength)
+    reas_s = "\n".join("  · " + r for r in reasons[:3]) if reasons else ""
     return (
-        "BTC  15хв  |  %s  |  %s  |  %+d\n"
+        "%s   %s   Score %+d\n"
         "\n"
-        "$%.2f  |  %s  |  %s\n"
+        "$%.2f  ·  %s  ·  %s\n"
         "\n"
         "%s\n"
         "\n"
@@ -580,9 +574,9 @@ def signal_msg(dec, strength, score, price, mkt_cond, sess_name, key_sig, logic,
     ) % (direction, str_label, score, price, mkt_cond, sess_name, key_sig, logic, reas_s)
 
 def trade_ok_msg(dec, mkt, bal, amount, pot, logic):
-    direction = "UP ▲" if dec=="UP" else "DOWN ▼"
+    direction = "🟢 UP" if dec=="UP" else "🔴 DOWN"
     return (
-        "СТАВКА ВИКОНАНА  |  %s\n"
+        "✅ Ставка виконана  %s\n"
         "\n"
         "%s\n"
         "\n"
@@ -594,14 +588,14 @@ def trade_ok_msg(dec, mkt, bal, amount, pot, logic):
     ) % (direction, mkt[:55], amount, bal, pot, logic[:120])
 
 def trade_fail_msg(err):
-    return "СТАВКА НЕ ВИКОНАНА\n\n%s" % err
+    return "❌ Ставка не виконана\n\n%s" % err
 
 # ─────────────────────────────────────────────
 # КЛАВІАТУРА
 # ─────────────────────────────────────────────
 def kb(s):
-    w = "Гаманець: підключено" if s.ok   else "Підключити гаманець"
-    a = "Авто: вимк"           if s.auto else "Авто: увімк"
+    w = "✅ Гаманець підключено" if s.ok   else "Підключити гаманець"
+    a = "Авто: вимк"             if s.auto else "Авто: увімк"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(w, callback_data="wallet"),
          InlineKeyboardButton(a, callback_data="auto_toggle")],
@@ -616,7 +610,7 @@ def kb(s):
 WELCOME = (
     "BTC Polymarket Bot\n"
     "\n"
-    "Сигнали кожні 15 хв  —  :00  :15  :30  :45 UTC\n"
+    "Сигнали кожні 15 хв  —  :00 :15 :30 :45 UTC\n"
     "Ставка  —  13% від балансу\n"
     "\n"
     "Як підключити:\n"
@@ -711,7 +705,7 @@ async def on_callback(u,c):
                 "condition_id:\n%s\n\n"
                 "YES token:\n%s\n\n"
                 "NO token:\n%s\n\n"
-                "YES: %.4f  |  NO: %.4f\n"
+                "YES: %.4f  ·  NO: %.4f\n"
                 "Закривається через: %.0f сек" % (
                     m["q"][:80], m["cid"], m["yes_id"], m["no_id"],
                     m["yes_p"], m["no_p"], m["diff"]))
@@ -785,7 +779,7 @@ async def on_message(u,c):
         bal,err=get_balance(s); bet=s.bet_size(bal)
         bal_str=("$%.2f USDC" % bal) if (bal is not None and bal>0) else ("$0  (%s)" % err)
         await u.message.reply_text(
-            "Гаманець підключено\n\n"
+            "✅ Гаманець підключено\n\n"
             "Підписувач:  %s\n"
             "Funder:      %s\n\n"
             "Баланс:  %s\n"
@@ -796,7 +790,7 @@ async def on_message(u,c):
     if s.pending and time.time()-s.pending.get("ts",0)<=600:
         try:
             amount=float(txt)
-            if amount<5 or amount>500: await u.message.reply_text("Сума від $5 до $500"); return
+            if amount<1 or amount>500: await u.message.reply_text("Сума від $1 до $500"); return
             direction=s.pending["dir"]
             ikb=InlineKeyboardMarkup([[
                 InlineKeyboardButton("Підтвердити  $%.2f  →  %s" % (amount,direction),
@@ -809,24 +803,24 @@ async def on_message(u,c):
 # АВТО ТОРГІВЛЯ
 # ─────────────────────────────────────────────
 async def auto_trade(app,s,p,result):
-    dec=result.get("decision"); logic=result.get("logic","")
+    dec=result.get("decision"); strength=result.get("strength","LOW"); logic=result.get("logic","")
+    print("[Auto] uid=%d dec=%s str=%s" % (s.uid,dec,strength))
     if not dec: return
     bal,err=get_balance(s)
     if not bal or bal<=0:
         await app.bot.send_message(chat_id=s.uid,
             text="Баланс $0. Поповни на polymarket.com → Deposit"); return
     amount=s.bet_size(bal)
-    if amount<5:
+    if amount<1:
         await app.bot.send_message(chat_id=s.uid,
-            text="Ставка $%.2f менша за мінімум $5. Поповни баланс." % amount); return
+            text="Ставка $%.2f менша за мінімум. Поповни баланс." % amount); return
     bet=place_bet(s,dec,amount)
     if bet["ok"]:
-        real_amount=bet.get("amount",amount)
-        s.trades.append({"dec":dec,"amount":real_amount,"entry":p["price"]["cur"],
+        s.trades.append({"dec":dec,"amount":amount,"entry":p["price"]["cur"],
                          "time":str(datetime.datetime.now(datetime.timezone.utc))})
         await app.bot.send_message(chat_id=s.uid,
-            text=trade_ok_msg(dec, bet.get("mkt","Polymarket"), bal, real_amount, bet.get("pot",0), logic))
-        print("[Auto] OK uid=%d $%.2f" % (s.uid,real_amount))
+            text=trade_ok_msg(dec, bet.get("mkt","Polymarket"), bal, amount, bet.get("pot",0), logic))
+        print("[Auto] OK uid=%d $%.2f" % (s.uid,amount))
     else:
         await app.bot.send_message(chat_id=s.uid, text=trade_fail_msg(bet["err"]))
         print("[Auto] FAIL uid=%d: %s" % (s.uid,bet["err"]))
@@ -875,7 +869,7 @@ async def cycle(app,s):
     else:
         s.pending={"dir":dec,"ts":time.time(),"price":p["price"]["cur"]}
         bal,_=get_balance(s); bet=s.bet_size(bal)
-        hint=("\n\nРекомендована ставка: $%.2f  (13%%)" % bet) if bal else ""
+        hint=("\n\nРекомендована ставка: $%.2f (13%%)" % bet) if bal else ""
         ikb=InlineKeyboardMarkup([[
             InlineKeyboardButton("Так — торгувати", callback_data="confirm_%s" % dec),
             InlineKeyboardButton("Пропустити",      callback_data="skip")]])
