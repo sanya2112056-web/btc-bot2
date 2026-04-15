@@ -10,9 +10,10 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
-OI_CACHE   = "oi_cache.json"
-DUMP_FILE  = "signals_dump.json"
-TRADES_LOG = "trades_log.json"   # повний лог ставок
+OI_CACHE      = "oi_cache.json"
+DUMP_FILE     = "signals_dump.json"
+TRADES_LOG    = "trades_log.json"
+POLY_WR_LOG   = "poly_winrate.json"   # вінрейт Polymarket (реальні продажі)
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -22,21 +23,21 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 class Session:
     def __init__(self, uid):
-        self.uid          = uid
-        self.key          = ""
-        self.funder       = ""
-        self.address      = None
-        self.ok           = False
-        self.auto         = False
-        self.signals      = []
-        self.trades       = []
-        self.open_bets    = []   # [{token_id, direction, amount, size, placed_at, mkt}]
-        self.state        = None
-        self.tmp_key      = None
-        self.pending      = {}
-        self.hist         = "hist_%d.json" % uid
-        self.err_f        = "err_%d.json"  % uid
-        self._client      = None
+        self.uid       = uid
+        self.key       = ""
+        self.funder    = ""
+        self.address   = None
+        self.ok        = False
+        self.auto      = False
+        self.signals   = []
+        self.trades    = []
+        self.open_bets = []   # [{token_id, direction, amount, size, placed_at, mkt, market_end}]
+        self.state     = None
+        self.tmp_key   = None
+        self.pending   = {}
+        self.hist      = "hist_%d.json" % uid
+        self.err_f     = "err_%d.json"  % uid
+        self._client   = None
         self._load()
 
     def _load(self):
@@ -73,7 +74,7 @@ def sess(uid):
     return _sessions[uid]
 
 # ─────────────────────────────────────────────
-# CLOB КЛІЄНТ (один на сесію)
+# CLOB КЛІЄНТ
 # ─────────────────────────────────────────────
 def get_client(s):
     if s._client is not None:
@@ -125,7 +126,7 @@ def get_balance(s):
         return 0.0, err[:100]
 
 # ─────────────────────────────────────────────
-# ПОШУК МАРКЕТУ
+# ПОШУК МАРКЕТУ (повертає також market_end timestamp)
 # ─────────────────────────────────────────────
 def find_market():
     SLUG = "btc-updown-15m-"; ROUND = 900
@@ -180,7 +181,8 @@ def find_market():
                 if not yi or not ni: continue
                 q=m.get("question","") or title
                 print("[Market] ЗНАЙДЕНО: %s diff=%.0fs" % (q[:55],diff))
-                return {"yes_id":yi,"no_id":ni,"yes_p":yp,"no_p":np_,"q":q,"cid":cid,"diff":round(diff,1)}
+                return {"yes_id":yi,"no_id":ni,"yes_p":yp,"no_p":np_,
+                        "q":q,"cid":cid,"diff":round(diff,1),"end_ts":et or (now+900)}
         except Exception as e:
             print("[Market] err: %s" % e)
         return None
@@ -195,7 +197,7 @@ def find_market():
     print("[Market] НЕ ЗНАЙДЕНО"); return None
 
 # ─────────────────────────────────────────────
-# СТАВКА
+# СТАВКА з retry (до 3 спроб при 500 помилці)
 # ─────────────────────────────────────────────
 def place_bet(s, direction: str, amount: float) -> dict:
     if not s.ok:   return {"ok":False,"err":"Гаманець не підключено"}
@@ -203,9 +205,11 @@ def place_bet(s, direction: str, amount: float) -> dict:
     mkt = find_market()
     if not mkt: return {"ok":False,"err":"Активний маркет не знайдено"}
 
-    token_id = mkt["yes_id"] if direction=="UP" else mkt["no_id"]
-    price    = mkt["yes_p"]  if direction=="UP" else mkt["no_p"]
-    price    = max(0.01, min(0.99, float(price)))
+    token_id   = mkt["yes_id"] if direction=="UP" else mkt["no_id"]
+    price      = mkt["yes_p"]  if direction=="UP" else mkt["no_p"]
+    price      = max(0.01, min(0.99, float(price)))
+    market_end = mkt.get("end_ts", time.time()+900)
+
     try:
         r = requests.get("https://clob.polymarket.com/midpoints", params={"token_id":token_id}, timeout=10)
         if r.status_code==200:
@@ -215,106 +219,274 @@ def place_bet(s, direction: str, amount: float) -> dict:
 
     size = round(amount/price, 2)
     print("[Bet] dir=%s price=%.4f size=%.2f usdc=%.2f"%(direction,price,size,amount))
-    try:
-        from py_clob_client.clob_types import OrderArgs, OrderType
-        from py_clob_client.order_builder.constants import BUY
-        client = get_client(s)
-        order  = client.create_order(OrderArgs(token_id=token_id, price=price, size=size, side=BUY))
-        resp   = client.post_order(order, OrderType.GTC)
-        print("[Bet] OK: %s" % str(resp)[:100])
-        return {"ok":True,"resp":resp,"price":price,"pot":round(size-amount,2),
-                "mkt":mkt["q"][:60],"token_id":token_id,"size":size}
-    except Exception as e:
-        err=str(e); print("[Bet] FAIL: %s"%err)
-        if any(x in err.lower() for x in ["unauthorized","401","forbidden","invalid api key"]): s.reset_client()
-        if "not enough" in err.lower() or "allowance" in err.lower():
-            return {"ok":False,"err":"Недостатньо USDC на Polymarket"}
-        return {"ok":False,"err":err[:200]}
+
+    last_err = ""
+    for attempt in range(1, 4):   # до 3 спроб
+        try:
+            from py_clob_client.clob_types import OrderArgs, OrderType
+            from py_clob_client.order_builder.constants import BUY
+            client = get_client(s)
+            order  = client.create_order(OrderArgs(token_id=token_id, price=price, size=size, side=BUY))
+            resp   = client.post_order(order, OrderType.GTC)
+            print("[Bet] OK attempt=%d: %s" % (attempt, str(resp)[:100]))
+            return {"ok":True,"resp":resp,"price":price,"pot":round(size-amount,2),
+                    "mkt":mkt["q"][:60],"token_id":token_id,"size":size,"market_end":market_end}
+        except Exception as e:
+            last_err = str(e)
+            print("[Bet] attempt=%d FAIL: %s" % (attempt, last_err))
+            # При 500 — скидаємо клієнт і повторюємо
+            if "500" in last_err or "execution" in last_err.lower():
+                s.reset_client()
+                if attempt < 3:
+                    print("[Bet] retry in 3s...")
+                    time.sleep(3)
+                    continue
+            # При auth помилці — скидаємо і виходимо
+            if any(x in last_err.lower() for x in ["unauthorized","401","forbidden","invalid api key"]):
+                s.reset_client()
+                break
+            # При balance помилці — виходимо одразу
+            if "not enough" in last_err.lower() or "allowance" in last_err.lower():
+                return {"ok":False,"err":"Недостатньо USDC на Polymarket"}
+            break
+
+    return {"ok":False,"err":last_err[:200]}
 
 # ─────────────────────────────────────────────
-# ПРОДАЖ ПОЗИЦІЇ (авто-виграш)
-# Продаємо токени назад через SELL ордер
-# коли ціна токена >= threshold (0.90)
+# FORCE SELL — примусове закриття позиції
+# mode: "normal" | "aggressive" | "panic"
+# panic = продаємо за будь-якою ціною (price=0.01)
 # ─────────────────────────────────────────────
-def sell_position(s, token_id: str, size: float, min_price: float = 0.90) -> dict:
+def force_sell(s, token_id: str, size: float, mode: str = "normal") -> dict:
     """
-    Продає size шерів токена за ринковою ціною якщо вона >= min_price.
-    Повертає {"ok": True/False, "price": ..., "err": ...}
+    Закриває позицію через SELL ордер.
+    normal:     sell_price = mid - 0.02  (звичайний)
+    aggressive: sell_price = mid - 0.05  (менша ціна для виконання)
+    panic:      sell_price = 0.01        (будь-якою ціною)
+    Повертає {"ok", "price", "err"}
     """
+    # Отримуємо поточну ціну
+    cur_price = 0.5
     try:
         r = requests.get("https://clob.polymarket.com/midpoints",
                          params={"token_id": token_id}, timeout=10)
-        if r.status_code != 200:
-            return {"ok":False,"err":"Не вдалось отримати ціну"}
-        cur_price = float(r.json().get("mid", 0))
-        print("[Sell] token=%s price=%.4f threshold=%.2f" % (token_id[:16], cur_price, min_price))
-        if cur_price < min_price:
-            return {"ok":False,"err":"Ціна %.4f < %.2f — не продаємо" % (cur_price, min_price)}
+        if r.status_code == 200:
+            cur_price = float(r.json().get("mid", 0.5))
+    except: pass
 
-        from py_clob_client.clob_types import OrderArgs, OrderType
-        from py_clob_client.order_builder.constants import SELL
-        client = get_client(s)
-        sell_price = max(0.01, min(0.99, round(cur_price - 0.02, 4)))  # трохи нижче mid для виконання
-        order = client.create_order(OrderArgs(
-            token_id=token_id, price=sell_price, size=size, side=SELL))
-        resp = client.post_order(order, OrderType.GTC)
-        print("[Sell] OK: %s" % str(resp)[:100])
-        return {"ok":True,"price":cur_price,"resp":resp}
-    except Exception as e:
-        err = str(e)
-        print("[Sell] FAIL: %s" % err)
-        if any(x in err.lower() for x in ["unauthorized","401","forbidden"]): s.reset_client()
-        return {"ok":False,"err":err[:200]}
+    print("[ForceSell] token=%s mode=%s price=%.4f size=%.2f" % (
+        token_id[:16], mode, cur_price, size))
+
+    if mode == "panic":
+        sell_price = 0.01
+    elif mode == "aggressive":
+        sell_price = max(0.01, min(0.99, round(cur_price - 0.05, 4)))
+    else:
+        sell_price = max(0.01, min(0.99, round(cur_price - 0.02, 4)))
+
+    last_err = ""
+    for attempt in range(1, 4):
+        try:
+            from py_clob_client.clob_types import OrderArgs, OrderType
+            from py_clob_client.order_builder.constants import SELL
+            client = get_client(s)
+            order  = client.create_order(OrderArgs(
+                token_id=token_id, price=sell_price, size=size, side=SELL))
+            resp   = client.post_order(order, OrderType.GTC)
+            print("[ForceSell] OK attempt=%d: %s" % (attempt, str(resp)[:100]))
+            return {"ok":True,"price":cur_price,"sell_price":sell_price,"resp":resp}
+        except Exception as e:
+            last_err = str(e)
+            print("[ForceSell] attempt=%d FAIL: %s" % (attempt, last_err))
+            if "500" in last_err or "execution" in last_err.lower():
+                s.reset_client()
+                if attempt < 3:
+                    time.sleep(2)
+                    # Підвищуємо агресивність при кожній невдалій спробі
+                    if mode == "normal":     sell_price = max(0.01, sell_price - 0.03)
+                    elif mode == "aggressive": sell_price = max(0.01, sell_price - 0.05)
+                    continue
+            if any(x in last_err.lower() for x in ["unauthorized","401","forbidden"]):
+                s.reset_client(); break
+            break
+
+    return {"ok":False,"err":last_err[:200]}
 
 # ─────────────────────────────────────────────
-# ПЕРЕВІРКА ВІДКРИТИХ СТАВОК — авто-продаж
-# Викликається в кожному циклі
+# POLYMARKET ВІНРЕЙТ — лог реальних продажів
+# ─────────────────────────────────────────────
+def poly_log_result(bet: dict, result: str, sell_price: float, profit: float):
+    """result: WIN | LOSS | FORCED"""
+    try:
+        data = []
+        if os.path.exists(POLY_WR_LOG):
+            with open(POLY_WR_LOG) as f: data = json.load(f)
+        data.append({
+            "time":        datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "direction":   bet.get("direction",""),
+            "mkt":         bet.get("mkt",""),
+            "amount":      bet.get("amount",0),
+            "size":        bet.get("size",0),
+            "entry_price": bet.get("entry_price",0),
+            "sell_price":  sell_price,
+            "profit":      profit,
+            "result":      result,
+            "strength":    bet.get("strength",""),
+            "score":       bet.get("score",0),
+        })
+        data = data[-500:]
+        with open(POLY_WR_LOG, "w") as f: json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("[PolyWR] Error: %s" % e)
+
+def poly_winrate_msg():
+    """Формує повідомлення з вінрейтом Polymarket."""
+    if not os.path.exists(POLY_WR_LOG):
+        return "Polymarket вінрейт\n\nДаних поки немає.\nВінрейт рахується після першого продажу."
+    try:
+        with open(POLY_WR_LOG) as f: data = json.load(f)
+        if not data:
+            return "Polymarket вінрейт\n\nДаних поки немає."
+        total  = len(data)
+        wins   = [x for x in data if x.get("result")=="WIN"]
+        losses = [x for x in data if x.get("result")=="LOSS"]
+        forced = [x for x in data if x.get("result")=="FORCED"]
+        wr     = round(len(wins)/total*100,1) if total else 0
+        bar_w  = int(wr/5); bar="▓"*bar_w+"░"*(20-bar_w)
+        total_profit = round(sum(x.get("profit",0) for x in data), 2)
+        avg_profit   = round(total_profit/total, 2) if total else 0
+        lines = [
+            "Polymarket вінрейт",
+            "",
+            "Всього угод: %d" % total,
+            "Перемог:     %d" % len(wins),
+            "Поразок:     %d" % len(losses),
+            "Force-sell:  %d" % len(forced),
+            "",
+            "Вінрейт: %.1f%%  [%s]" % (wr, bar),
+            "",
+            "Загальний P&L:  $%.2f" % total_profit,
+            "Середній P&L:   $%.2f" % avg_profit,
+        ]
+        # Останні 5
+        lines += ["", "Останні угоди:"]
+        for x in data[-5:]:
+            sign = "+" if x.get("profit",0) >= 0 else ""
+            lines.append("  %s %s  %s$%.2f" % (
+                x.get("direction","?"), x.get("result","?"),
+                sign, x.get("profit",0)))
+        return "\n".join(lines)
+    except Exception as e:
+        return "Помилка читання: %s" % e
+
+# ─────────────────────────────────────────────
+# ПЕРЕВІРКА ВІДКРИТИХ СТАВОК
+# Логіка закриття:
+#   1. Прибуток >= +90% → normal sell
+#   2. До кінця маркету 60 сек → normal sell
+#   3. До кінця маркету 30 сек → aggressive sell
+#   4. До кінця маркету 15 сек → panic sell
 # ─────────────────────────────────────────────
 async def check_open_bets(app, s):
     if not s.open_bets: return
-    now = time.time()
+    now        = time.time()
     still_open = []
+
     for bet in s.open_bets:
-        age = now - bet.get("placed_at", now)
-        # Перевіряємо якщо пройшло >= 2 хвилини після ставки
-        if age < 120:
+        age        = now - bet.get("placed_at", now)
+        market_end = bet.get("market_end", now + 900)
+        time_left  = market_end - now
+        token_id   = bet.get("token_id","")
+        size       = bet.get("size", 0)
+        amount     = bet.get("amount", 0)
+        entry      = bet.get("entry_price", 0.5)
+        direction  = bet.get("direction","")
+        mkt        = bet.get("mkt","")
+
+        # Чекаємо мінімум 60 сек після ставки
+        if age < 60:
             still_open.append(bet); continue
 
-        token_id = bet.get("token_id")
-        size     = bet.get("size", 0)
-        mkt      = bet.get("mkt", "")
-        direction= bet.get("direction","")
-        amount   = bet.get("amount", 0)
+        # Отримуємо поточну ціну токена
+        cur_price = 0.0
+        try:
+            r = requests.get("https://clob.polymarket.com/midpoints",
+                             params={"token_id": token_id}, timeout=8)
+            if r.status_code == 200:
+                cur_price = float(r.json().get("mid", 0))
+        except: pass
 
-        result = sell_position(s, token_id, size, min_price=0.90)
+        profit_pct = ((cur_price - entry) / entry * 100) if entry > 0 else 0
+
+        # Визначаємо чи треба продавати і який режим
+        should_sell = False
+        sell_mode   = "normal"
+        reason      = ""
+
+        if profit_pct >= 90:
+            should_sell = True; sell_mode = "normal"
+            reason = "прибуток +%.0f%%" % profit_pct
+        elif time_left <= 15:
+            should_sell = True; sell_mode = "panic"
+            reason = "panic: %.0f сек до кінця" % max(0, time_left)
+        elif time_left <= 30:
+            should_sell = True; sell_mode = "aggressive"
+            reason = "aggressive: %.0f сек до кінця" % max(0, time_left)
+        elif time_left <= 60:
+            should_sell = True; sell_mode = "normal"
+            reason = "force: %.0f сек до кінця" % max(0, time_left)
+
+        if not should_sell:
+            still_open.append(bet); continue
+
+        print("[AutoSell] uid=%d reason=%s mode=%s" % (s.uid, reason, sell_mode))
+        result = force_sell(s, token_id, size, mode=sell_mode)
+
         if result["ok"]:
-            profit = round(result["price"] * size - amount, 2)
-            await app.bot.send_message(chat_id=s.uid,
-                text=(
-                    "Позицію продано\n\n"
-                    "%s  %s\n\n"
-                    "Ціна продажу:  %.4f\n"
-                    "Прибуток:      +$%.2f\n\n"
-                    "Гроші повернулись на баланс."
-                ) % (direction, mkt[:50], result["price"], profit))
-            print("[AutoSell] OK uid=%d profit=$%.2f" % (s.uid, profit))
-            # Логуємо в trades_log
-            _log_trade(bet, "SOLD", result["price"], profit)
+            actual_price = result.get("price", cur_price)
+            profit       = round(actual_price * size - amount, 2)
+            is_win       = profit > 0
+            poly_result  = "WIN" if is_win else ("FORCED" if "сек" in reason else "LOSS")
+
+            # Записуємо в вінрейт Polymarket
+            poly_log_result(bet, poly_result, actual_price, profit)
+            _log_trade(bet, "SOLD", actual_price, profit)
+
+            sign = "+" if profit >= 0 else ""
+            msg  = (
+                "Позицію закрито  %s %s\n"
+                "\n"
+                "%s\n"
+                "\n"
+                "Причина:       %s\n"
+                "Ціна продажу:  %.4f\n"
+                "Прибуток:      %s$%.2f\n"
+                "Результат:     %s\n"
+                "\n"
+                "Гроші на балансі."
+            ) % (
+                "▲" if direction=="UP" else "▼", direction,
+                mkt[:55], reason, actual_price, sign, abs(profit), poly_result
+            )
+            await app.bot.send_message(chat_id=s.uid, text=msg)
+            print("[AutoSell] OK uid=%d %s$%.2f" % (s.uid, sign, profit))
         else:
-            # Ціна ще не досягла порогу — залишаємо відкритою
-            if "< " in result.get("err",""):
-                still_open.append(bet)
+            # Продаж не вдався — якщо паніка, логуємо як FORCED і виходимо
+            if sell_mode == "panic":
+                poly_log_result(bet, "FORCED", cur_price, 0)
+                await app.bot.send_message(chat_id=s.uid,
+                    text="Не вдалось закрити позицію\n\n%s\n\nПеревір вручну на polymarket.com" % mkt[:50])
+                print("[AutoSell] PANIC FAIL uid=%d" % s.uid)
             else:
-                # Інша помилка — теж залишаємо спробувати пізніше
                 still_open.append(bet)
-                print("[AutoSell] skip: %s" % result["err"])
+                print("[AutoSell] skip, retry later: %s" % result["err"][:80])
+
     s.open_bets = still_open
 
 # ─────────────────────────────────────────────
-# ЛОГ СТАВОК (повний запис для /stats)
+# ЛОГ СТАВОК
 # ─────────────────────────────────────────────
 def _log_trade(bet_info: dict, status: str, exit_price: float = 0, profit: float = 0):
-    """Записує повну інформацію про ставку в TRADES_LOG."""
     try:
         trades = []
         if os.path.exists(TRADES_LOG):
@@ -619,7 +791,7 @@ def analyze_with_ai(p,s):
         log.error("AI: %s",e); return None
 
 # ─────────────────────────────────────────────
-# СТАТИСТИКА
+# СТАТИСТИКА (сигнали AI)
 # ─────────────────────────────────────────────
 def check_outcomes(s):
     now=int(time.time()); changed=False
@@ -643,7 +815,7 @@ def stats_msg(s):
     wr=round(len(wins)/total*100,1)
     bar_w=int(wr/5); bar="▓"*bar_w+"░"*(20-bar_w)
     lines=[
-        "Статистика",
+        "Статистика сигналів AI",
         "",
         "Всього: %d   Перемог: %d   Поразок: %d" % (total,len(wins),total-len(wins)),
         "Вінрейт: %.1f%%  [%s]" % (wr,bar),
@@ -657,31 +829,28 @@ def stats_msg(s):
     return "\n".join(lines)
 
 def build_trades_file(s):
-    """Будує повний JSON файл з усіма ставками для відправки."""
     records = []
-    # Сигнали (з рішенням AI)
     for sig in s.signals:
         records.append({
-            "type":        "SIGNAL",
-            "time":        sig.get("time",""),
-            "decision":    sig.get("dec",""),
-            "strength":    sig.get("strength",""),
-            "score":       sig.get("confidence_score",0),
-            "outcome":     sig.get("outcome","PENDING"),
+            "type": "SIGNAL",
+            "time": sig.get("time",""),
+            "decision": sig.get("dec",""),
+            "strength": sig.get("strength",""),
+            "score": sig.get("confidence_score",0),
+            "outcome": sig.get("outcome","PENDING"),
             "entry_price": sig.get("entry",0),
-            "exit_price":  sig.get("exit",0),
-            "price_move":  sig.get("move",0),
-            "market":      sig.get("mkt_cond",""),
-            "session":     sig.get("session",""),
-            "key_signal":  sig.get("key_signal",""),
-            "logic":       sig.get("logic",""),
-            "reasons":     sig.get("reasons",[]),
-            "amd_phase":   sig.get("amd_phase",""),
-            "sweep":       sig.get("sweep_type",""),
-            "trap":        sig.get("trap",""),
+            "exit_price": sig.get("exit",0),
+            "price_move": sig.get("move",0),
+            "market": sig.get("mkt_cond",""),
+            "session": sig.get("session",""),
+            "key_signal": sig.get("key_signal",""),
+            "logic": sig.get("logic",""),
+            "reasons": sig.get("reasons",[]),
+            "amd_phase": sig.get("amd_phase",""),
+            "sweep": sig.get("sweep_type",""),
+            "trap": sig.get("trap",""),
             "structure_15m": sig.get("st15m",""),
         })
-    # Trades log якщо є
     if os.path.exists(TRADES_LOG):
         try:
             with open(TRADES_LOG) as f:
@@ -693,7 +862,7 @@ def build_trades_file(s):
     return records
 
 # ─────────────────────────────────────────────
-# ПОВІДОМЛЕННЯ (без ліній, мінімум смайліків)
+# ПОВІДОМЛЕННЯ
 # ─────────────────────────────────────────────
 def signal_msg(dec, strength, score, price, mkt_cond, sess_name, key_sig, logic, reasons):
     direction = "UP" if dec=="UP" else "DOWN"
@@ -730,7 +899,7 @@ def trade_fail_msg(err):
     return "Ставка не виконана\n\n%s" % err
 
 # ─────────────────────────────────────────────
-# КЛАВІАТУРА
+# КЛАВІАТУРА (додана кнопка Вінрейт Полі)
 # ─────────────────────────────────────────────
 def kb(s):
     w = "Гаманець: підключено" if s.ok   else "Підключити гаманець"
@@ -738,12 +907,13 @@ def kb(s):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(w, callback_data="wallet"),
          InlineKeyboardButton(a, callback_data="auto_toggle")],
-        [InlineKeyboardButton("Баланс",     callback_data="balance"),
-         InlineKeyboardButton("Статистика", callback_data="stats")],
-        [InlineKeyboardButton("Аналіз",     callback_data="analyze"),
-         InlineKeyboardButton("Маркет",     callback_data="market")],
-        [InlineKeyboardButton("Новини",     callback_data="news"),
-         InlineKeyboardButton("Помилки",    callback_data="errors")],
+        [InlineKeyboardButton("Баланс",       callback_data="balance"),
+         InlineKeyboardButton("Статистика",   callback_data="stats")],
+        [InlineKeyboardButton("Вінрейт Полі", callback_data="poly_wr"),
+         InlineKeyboardButton("Аналіз",       callback_data="analyze")],
+        [InlineKeyboardButton("Маркет",       callback_data="market"),
+         InlineKeyboardButton("Новини",       callback_data="news")],
+        [InlineKeyboardButton("Помилки",      callback_data="errors")],
     ])
 
 WELCOME = (
@@ -751,6 +921,7 @@ WELCOME = (
     "\n"
     "Сигнали кожні 15 хв  —  :00 :15 :30 :45 UTC\n"
     "Ставка  —  13% від балансу  (мін. $1)\n"
+    "Позиції закриваються автоматично\n"
     "\n"
     "Як підключити:\n"
     "\n"
@@ -774,14 +945,12 @@ async def cmd_start(u,c):
 
 async def cmd_stats(u,c):
     s=sess(u.effective_user.id); check_outcomes(s)
-    # Текстове повідомлення
     await u.message.reply_text(stats_msg(s))
-    # JSON файл з повними даними
     records = build_trades_file(s)
     if records:
         try:
             import io
-            data = json.dumps(records, ensure_ascii=False, indent=2)
+            data  = json.dumps(records, ensure_ascii=False, indent=2)
             fname = "trades_%d.json" % s.uid
             await u.message.reply_document(
                 document=io.BytesIO(data.encode("utf-8")),
@@ -836,9 +1005,12 @@ async def on_callback(u,c):
 
     elif q.data=="balance":
         bal, err = get_balance(s)
+        open_val = round(sum(b.get("amount",0) for b in s.open_bets), 2)
         if bal is not None and bal > 0:
-            await q.message.reply_text(
-                "Баланс: $%.2f USDC\nСтавка: $%.2f (13%%)" % (bal, s.bet_size(bal)))
+            msg = "Баланс: $%.2f USDC\nСтавка: $%.2f (13%%)" % (bal, s.bet_size(bal))
+            if open_val > 0:
+                msg += "\n\nВ позиціях: $%.2f\nЗагалом: $%.2f" % (open_val, bal + open_val)
+            await q.message.reply_text(msg)
         else:
             await q.message.reply_text(
                 "Баланс: $0.00\n\n%s\n\nПоповни на polymarket.com → Deposit" % err)
@@ -850,7 +1022,7 @@ async def on_callback(u,c):
         if records:
             try:
                 import io
-                data = json.dumps(records, ensure_ascii=False, indent=2)
+                data  = json.dumps(records, ensure_ascii=False, indent=2)
                 fname = "trades_%d.json" % s.uid
                 await q.message.reply_document(
                     document=io.BytesIO(data.encode("utf-8")),
@@ -858,6 +1030,9 @@ async def on_callback(u,c):
                     caption="Повний лог ставок та сигналів")
             except Exception as e:
                 print("[Stats] file error: %s" % e)
+
+    elif q.data=="poly_wr":
+        await q.message.reply_text(poly_winrate_msg())
 
     elif q.data=="analyze":
         await q.message.reply_text("Аналізую..."); await cycle(c.application,s)
@@ -982,28 +1157,27 @@ async def auto_trade(app,s,p,result):
             text="Ставка $%.2f менша за мінімум $1. Поповни баланс." % amount); return
     bet=place_bet(s,dec,amount)
     if bet["ok"]:
-        # Зберігаємо відкриту ставку для авто-продажу
         open_bet = {
-            "token_id":   bet["token_id"],
-            "direction":  dec,
-            "amount":     amount,
-            "size":       bet["size"],
-            "entry_price":bet["price"],
-            "placed_at":  time.time(),
-            "mkt":        bet.get("mkt",""),
-            "strength":   strength,
-            "logic":      logic,
-            "score":      result.get("confidence_score",0),
-            "key_signal": result.get("key_signal",""),
-            "reasons":    result.get("reasons",[]),
-            "amd_phase":  p["amd"].get("phase",""),
-            "sweep":      p["liq"].get("sw15",{}).get("type","NONE"),
-            "struct_15m": p["struct"]["15m"],
-            "session":    p["ctx"]["sess"],
-            "btc_price":  p["price"]["cur"],
+            "token_id":    bet["token_id"],
+            "direction":   dec,
+            "amount":      amount,
+            "size":        bet["size"],
+            "entry_price": bet["price"],
+            "placed_at":   time.time(),
+            "market_end":  bet.get("market_end", time.time()+900),
+            "mkt":         bet.get("mkt",""),
+            "strength":    strength,
+            "logic":       logic,
+            "score":       result.get("confidence_score",0),
+            "key_signal":  result.get("key_signal",""),
+            "reasons":     result.get("reasons",[]),
+            "amd_phase":   p["amd"].get("phase",""),
+            "sweep":       p["liq"].get("sw15",{}).get("type","NONE"),
+            "struct_15m":  p["struct"]["15m"],
+            "session":     p["ctx"]["sess"],
+            "btc_price":   p["price"]["cur"],
         }
         s.open_bets.append(open_bet)
-        # Логуємо ставку
         _log_trade(open_bet, "OPEN")
 
         s.trades.append({"dec":dec,"amount":amount,"entry":p["price"]["cur"],
@@ -1019,7 +1193,7 @@ async def auto_trade(app,s,p,result):
 # ЦИКЛ
 # ─────────────────────────────────────────────
 async def cycle(app,s):
-    # Перевіряємо відкриті ставки — авто-продаж
+    # Спочатку перевіряємо відкриті позиції
     if s.ok and s.open_bets:
         await check_open_bets(app, s)
 
@@ -1071,8 +1245,20 @@ async def cycle(app,s):
             text=txt+hint+"\n\nВведи суму або натисни кнопку:", reply_markup=ikb)
 
 # ─────────────────────────────────────────────
-# ПЛАНУВАЛЬНИК
+# ПЛАНУВАЛЬНИК (додатковий мікро-цикл для позицій)
+# Кожні 30 сек перевіряємо відкриті ставки
 # ─────────────────────────────────────────────
+async def position_watcher(app):
+    """Окремий цикл — перевіряє відкриті позиції кожні 30 сек."""
+    while True:
+        await asyncio.sleep(30)
+        for uid,s in list(_sessions.items()):
+            if s.ok and s.open_bets:
+                try:
+                    await check_open_bets(app, s)
+                except Exception as e:
+                    log.error("[Watcher] uid=%d: %s", uid, e)
+
 async def scheduler(app):
     while True:
         now=datetime.datetime.now(datetime.timezone.utc)
@@ -1102,7 +1288,8 @@ def main():
 
     async def startup(app):
         asyncio.create_task(scheduler(app))
-        log.info("BTC Polymarket Bot. 13%% bet. Auto-sell at 0.90+.")
+        asyncio.create_task(position_watcher(app))  # мікро-цикл для позицій
+        log.info("BTC Polymarket Bot. 13%% bet. Force-sell + retry + poly winrate.")
 
     app.post_init=startup
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
