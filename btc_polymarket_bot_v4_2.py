@@ -293,24 +293,24 @@ def force_sell(s, token_id: str, size: float, mode: str = "normal") -> dict:
             order  = client.create_order(OrderArgs(
                 token_id=token_id, price=sell_price, size=size, side=SELL))
             resp   = client.post_order(order, OrderType.GTC)
-            print("[ForceSell] OK attempt=%d: %s" % (attempt, str(resp)[:100]))
+            print("[ForceSell] OK attempt=%d sell_price=%.4f: %s" % (attempt, sell_price, str(resp)[:100]))
             return {"ok":True,"price":cur_price,"sell_price":sell_price,"resp":resp}
         except Exception as e:
             last_err = str(e)
-            print("[ForceSell] attempt=%d FAIL: %s" % (attempt, last_err))
+            print("[ForceSell] attempt=%d FAIL sell_price=%.4f err=%s" % (attempt, sell_price, last_err))
             if "500" in last_err or "execution" in last_err.lower():
                 s.reset_client()
                 if attempt < 3:
                     time.sleep(2)
-                    # Підвищуємо агресивність при кожній невдалій спробі
-                    if mode == "normal":     sell_price = max(0.01, sell_price - 0.03)
+                    if mode == "normal":       sell_price = max(0.01, sell_price - 0.03)
                     elif mode == "aggressive": sell_price = max(0.01, sell_price - 0.05)
+                    print("[ForceSell] retry attempt=%d new_sell_price=%.4f" % (attempt+1, sell_price))
                     continue
             if any(x in last_err.lower() for x in ["unauthorized","401","forbidden"]):
                 s.reset_client(); break
             break
 
-    return {"ok":False,"err":last_err[:200]}
+    return {"ok":False,"err":last_err}
 
 # ─────────────────────────────────────────────
 # POLYMARKET ВІНРЕЙТ — лог реальних продажів
@@ -340,41 +340,47 @@ def poly_log_result(bet: dict, result: str, sell_price: float, profit: float):
         print("[PolyWR] Error: %s" % e)
 
 def poly_winrate_msg():
-    """Формує повідомлення з вінрейтом Polymarket."""
     if not os.path.exists(POLY_WR_LOG):
         return "Polymarket вінрейт\n\nДаних поки немає.\nВінрейт рахується після першого продажу."
     try:
         with open(POLY_WR_LOG) as f: data = json.load(f)
         if not data:
             return "Polymarket вінрейт\n\nДаних поки немає."
-        total  = len(data)
-        wins   = [x for x in data if x.get("result")=="WIN"]
-        losses = [x for x in data if x.get("result")=="LOSS"]
-        forced = [x for x in data if x.get("result")=="FORCED"]
-        wr     = round(len(wins)/total*100,1) if total else 0
-        bar_w  = int(wr/5); bar="▓"*bar_w+"░"*(20-bar_w)
+        total   = len(data)
+        wins    = [x for x in data if x.get("result")=="WIN"]
+        losses  = [x for x in data if x.get("result")=="LOSS"]
+        forced  = [x for x in data if x.get("result")=="FORCED"]
+        # Реальний вінрейт по profit (WIN=profit>0, LOSS=profit<=0)
+        profit_wins = [x for x in data if x.get("profit",0) > 0]
+        wr      = round(len(profit_wins)/total*100,1) if total else 0
+        bar_w   = int(wr/5); bar="▓"*bar_w+"░"*(20-bar_w)
         total_profit = round(sum(x.get("profit",0) for x in data), 2)
         avg_profit   = round(total_profit/total, 2) if total else 0
         lines = [
             "Polymarket вінрейт",
             "",
-            "Всього угод: %d" % total,
-            "Перемог:     %d" % len(wins),
-            "Поразок:     %d" % len(losses),
-            "Force-sell:  %d" % len(forced),
+            "Всього угод:    %d" % total,
+            "WIN (profit>0): %d" % len(profit_wins),
+            "LOSS (profit≤0):%d" % (total - len(profit_wins)),
+            "  з яких WIN:   %d" % len(wins),
+            "  LOSS:         %d" % len(losses),
+            "  FORCED:       %d" % len(forced),
             "",
             "Вінрейт: %.1f%%  [%s]" % (wr, bar),
             "",
             "Загальний P&L:  $%.2f" % total_profit,
             "Середній P&L:   $%.2f" % avg_profit,
+            "",
+            "Останні угоди:",
         ]
-        # Останні 5
-        lines += ["", "Останні угоди:"]
         for x in data[-5:]:
-            sign = "+" if x.get("profit",0) >= 0 else ""
-            lines.append("  %s %s  %s$%.2f" % (
+            p   = x.get("profit", 0)
+            ep  = x.get("entry_price", 0)
+            sp  = x.get("sell_price", 0)
+            sign= "+" if p >= 0 else "-"
+            lines.append("  %s %s  entry=%.3f sell=%.3f  %s$%.2f" % (
                 x.get("direction","?"), x.get("result","?"),
-                sign, x.get("profit",0)))
+                ep, sp, sign, abs(p)))
         return "\n".join(lines)
     except Exception as e:
         return "Помилка читання: %s" % e
@@ -439,47 +445,85 @@ async def check_open_bets(app, s):
         if not should_sell:
             still_open.append(bet); continue
 
-        print("[AutoSell] uid=%d reason=%s mode=%s" % (s.uid, reason, sell_mode))
+        print("[AutoSell] uid=%d reason=%s mode=%s cur_price=%.4f profit_pct=%.1f time_left=%.0f" % (
+            s.uid, reason, sell_mode, cur_price, profit_pct, time_left))
+
         result = force_sell(s, token_id, size, mode=sell_mode)
 
         if result["ok"]:
+            sell_price   = result.get("sell_price", cur_price)
             actual_price = result.get("price", cur_price)
-            profit       = round(actual_price * size - amount, 2)
-            is_win       = profit > 0
-            poly_result  = "WIN" if is_win else ("FORCED" if "сек" in reason else "LOSS")
+            # Прибуток = (ціна продажу * кількість шерів) - витрачена сума
+            gross        = round(sell_price * size, 4)
+            profit       = round(gross - amount, 2)
+            # WIN/LOSS визначається тільки по profit — незалежно від причини закриття
+            poly_result  = "WIN" if profit > 0 else "LOSS"
 
-            # Записуємо в вінрейт Polymarket
-            poly_log_result(bet, poly_result, actual_price, profit)
-            _log_trade(bet, "SOLD", actual_price, profit)
+            poly_log_result(bet, poly_result, sell_price, profit)
+            _log_trade(bet, "SOLD", sell_price, profit)
 
-            sign = "+" if profit >= 0 else ""
-            msg  = (
+            sign   = "+" if profit >= 0 else "-"
+            pct    = round(profit / amount * 100, 1) if amount > 0 else 0
+            arrow  = "▲" if direction=="UP" else "▼"
+            msg    = (
                 "Позицію закрито  %s %s\n"
                 "\n"
                 "%s\n"
                 "\n"
-                "Причина:       %s\n"
-                "Ціна продажу:  %.4f\n"
-                "Прибуток:      %s$%.2f\n"
-                "Результат:     %s\n"
-                "\n"
-                "Гроші на балансі."
+                "Причина:        %s\n"
+                "Ціна входу:     %.4f\n"
+                "Ціна продажу:   %.4f  (mid: %.4f)\n"
+                "Ставка:         $%.2f\n"
+                "Повернулось:    $%.4f\n"
+                "P&L:            %s$%.2f (%s%.1f%%)\n"
+                "Результат:      %s"
             ) % (
-                "▲" if direction=="UP" else "▼", direction,
-                mkt[:55], reason, actual_price, sign, abs(profit), poly_result
+                arrow, direction, mkt[:55],
+                reason,
+                entry, sell_price, actual_price,
+                amount, gross,
+                sign, abs(profit), sign, abs(pct),
+                poly_result
             )
             await app.bot.send_message(chat_id=s.uid, text=msg)
-            print("[AutoSell] OK uid=%d %s$%.2f" % (s.uid, sign, profit))
+            print("[AutoSell] OK uid=%d result=%s profit=%s$%.2f" % (s.uid, poly_result, sign, abs(profit)))
         else:
-            # Продаж не вдався — якщо паніка, логуємо як FORCED і виходимо
+            err_txt = result.get("err","невідома помилка")
+            print("[AutoSell] FAIL uid=%d mode=%s err=%s" % (s.uid, sell_mode, err_txt))
+
             if sell_mode == "panic":
+                # Паніка не спрацювала — логуємо FORCED з $0 і повідомляємо детально
                 poly_log_result(bet, "FORCED", cur_price, 0)
+                _log_trade(bet, "FORCED_FAIL", cur_price, 0)
                 await app.bot.send_message(chat_id=s.uid,
-                    text="Не вдалось закрити позицію\n\n%s\n\nПеревір вручну на polymarket.com" % mkt[:50])
-                print("[AutoSell] PANIC FAIL uid=%d" % s.uid)
+                    text=(
+                        "Не вдалось закрити позицію\n\n"
+                        "%s  %s %s\n\n"
+                        "Режим:       panic\n"
+                        "Причина:     %s\n"
+                        "Ціна токена: %.4f\n"
+                        "Розмір:      %.2f шерів\n\n"
+                        "Помилка:\n%s\n\n"
+                        "Перевір вручну на polymarket.com"
+                    ) % (
+                        "▲" if direction=="UP" else "▼", direction, mkt[:50],
+                        reason, cur_price, size, err_txt
+                    ))
             else:
+                # Не паніка — повідомляємо і залишаємо для повторної спроби
                 still_open.append(bet)
-                print("[AutoSell] skip, retry later: %s" % result["err"][:80])
+                await app.bot.send_message(chat_id=s.uid,
+                    text=(
+                        "Помилка продажу позиції (спробую ще)\n\n"
+                        "%s  %s %s\n\n"
+                        "Режим:       %s\n"
+                        "Ціна токена: %.4f\n"
+                        "Час до кінця: %.0f сек\n\n"
+                        "Помилка:\n%s"
+                    ) % (
+                        "▲" if direction=="UP" else "▼", direction, mkt[:50],
+                        sell_mode, cur_price, max(0, time_left), err_txt
+                    ))
 
     s.open_bets = still_open
 
