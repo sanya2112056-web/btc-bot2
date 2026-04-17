@@ -184,12 +184,64 @@ def poly_log_closed(record: dict):
     except Exception as e:
         print("[PolyWR] Error: %s" % e)
 
+def _classify_poly_result(record: dict) -> str:
+    """
+    Правильно визначає WIN/LOSS для Polymarket ставки.
+
+    Проблема: коли маркет закривається, ціна токена стає 0.0
+    і panic sell продає за 0.01 → gross_return ≈ 0 → profit < 0 → LOSS.
+    Але реально це може бути WIN (виграшний токен = $1.00).
+
+    Рішення: якщо sell_price <= 0.01 (panic/forced) і ціна була 0 —
+    визначаємо результат по тому чи маркет вирішився на нашу користь.
+    Ознака WIN при panic: entry_price < 0.5 і ставили на правильний бік,
+    або gross_return > amount * 0.5 (повернулось більше половини).
+
+    Але найточніший спосіб: якщо close_reason містить "прибуток" — WIN,
+    якщо sell виконався по нормальній ціні (> 0.5) — WIN,
+    якщо panic і cur_price=0 — невідомо, рахуємо по реальному gross_return.
+    """
+    sell_price   = record.get("sell_price", 0)
+    cur_price    = record.get("cur_price", 0)
+    gross_return = record.get("gross_return", 0)
+    amount       = record.get("amount", 0)
+    reason       = record.get("close_reason", "")
+
+    # Нормальний продаж з гарною ціною — однозначно WIN
+    if sell_price >= 0.80 and gross_return > amount:
+        return "WIN"
+    if sell_price >= 0.80:
+        return "WIN"
+    # Прибуток за причиною
+    if "прибуток" in reason:
+        return "WIN"
+    # Gross return > вкладено — WIN
+    if amount > 0 and gross_return > amount:
+        return "WIN"
+    # Panic/force з ціною 0 — позиція resolved, рахуємо по gross
+    if sell_price <= 0.02 and cur_price == 0.0:
+        # Якщо gross > 50% від вкладеного — вважаємо LOSS але не катастрофічним
+        # Якщо gross майже 0 — LOSS
+        return "LOSS"
+    # Все решта
+    if amount > 0 and gross_return > amount:
+        return "WIN"
+    return "LOSS"
+
 def poly_winrate_msg() -> str:
     if not os.path.exists(POLY_WR_LOG):
         return "Polymarket вінрейт\n\nДаних поки немає.\nВінрейт з'явиться після першого продажу."
     try:
         with open(POLY_WR_LOG) as f: data = json.load(f)
         if not data: return "Polymarket вінрейт\n\nДаних поки немає."
+
+        # Переобчислюємо результати правильно
+        for x in data:
+            x["result"] = _classify_poly_result(x)
+            gross = x.get("gross_return", 0)
+            amt   = x.get("amount", 0)
+            x["real_profit"]  = round(gross - amt, 2)
+            x["real_pct"]     = round((gross - amt) / amt * 100, 1) if amt > 0 else 0
 
         total        = len(data)
         wins         = [x for x in data if x.get("result") == "WIN"]
@@ -203,8 +255,7 @@ def poly_winrate_msg() -> str:
         bar          = "▓" * bar_w + "░" * (20 - bar_w)
         roi          = round(total_profit / total_in * 100, 1) if total_in > 0 else 0
 
-        # Найкраща і найгірша угода
-        by_profit = sorted(data, key=lambda x: x.get("profit", 0))
+        by_profit = sorted(data, key=lambda x: x.get("real_profit", 0))
         best  = by_profit[-1] if by_profit else None
         worst = by_profit[0]  if by_profit else None
 
@@ -224,22 +275,28 @@ def poly_winrate_msg() -> str:
             "Avg P&L:       %s$%.2f" % ("+" if avg_profit >= 0 else "", abs(avg_profit)),
         ]
         if best:
-            lines += ["", "Найкраща:  %s %s  +$%.2f (+%.0f%%)" % (
-                best.get("direction","?"), best.get("mkt","")[:30],
-                best.get("profit",0), best.get("profit_pct",0))]
+            bp = best.get("real_profit", 0)
+            lines += ["", "Найкраща:  %s %s  %s$%.2f (%s%.0f%%)" % (
+                best.get("direction","?"), best.get("mkt","")[:28],
+                "+" if bp>=0 else "", abs(bp),
+                "+" if bp>=0 else "", abs(best.get("real_pct",0)))]
         if worst and worst != best:
-            lines += ["Найгірша:  %s %s  $%.2f (%.0f%%)" % (
-                worst.get("direction","?"), worst.get("mkt","")[:30],
-                worst.get("profit",0), worst.get("profit_pct",0))]
+            wp = worst.get("real_profit", 0)
+            lines += ["Найгірша:  %s %s  %s$%.2f (%s%.0f%%)" % (
+                worst.get("direction","?"), worst.get("mkt","")[:28],
+                "+" if wp>=0 else "", abs(wp),
+                "+" if wp>=0 else "", abs(worst.get("real_pct",0)))]
+
         lines += ["", "Останні угоди:"]
         for x in data[-7:]:
-            p    = x.get("profit", 0)
-            pct  = x.get("profit_pct", 0)
+            p    = x.get("real_profit", 0)
+            pct  = x.get("real_pct", 0)
             sign = "+" if p >= 0 else ""
             res  = x.get("result","?")
+            sp   = x.get("sell_price", 0)
             t    = x.get("closed_at","")[:16].replace("T"," ")
-            lines.append("  %s %s  %s$%.2f (%s%.0f%%)  %s" % (
-                x.get("direction","?"), res, sign, abs(p), sign, abs(pct), t))
+            lines.append("  %s %s  %s$%.2f (%s%.0f%%)  sell=%.3f  %s" % (
+                x.get("direction","?"), res, sign, abs(p), sign, abs(pct), sp, t))
         return "\n".join(lines)
     except Exception as e:
         return "Помилка: %s" % e
@@ -977,11 +1034,19 @@ def stats_msg(s):
     lines=["Статистика сигналів AI","",
            "Всього: %d   WIN: %d   LOSS: %d"%(total,len(wins),total-len(wins)),
            "Вінрейт: %.1f%%  [%s]"%(wr,bar),""]
+    # По силі сигналу
     for st in ["HIGH","MEDIUM","LOW"]:
         sub=[g for g in checked if g.get("strength")==st]
         if sub:
             w=len([g for g in sub if g["outcome"]=="WIN"])
             lines.append("%s: %d/%d (%.1f%%)"%(st,w,len(sub),round(w/len(sub)*100,1)))
+    # По сесії
+    lines += ["", "По сесіях:"]
+    for sess_name in ["ASIA","LONDON","NY_OPEN","NY_PM","DEAD"]:
+        sub=[g for g in checked if g.get("session")==sess_name]
+        if sub:
+            w=len([g for g in sub if g["outcome"]=="WIN"])
+            lines.append("  %s: %d/%d (%.1f%%)"%(sess_name,w,len(sub),round(w/len(sub)*100,1)))
     return "\n".join(lines)
 
 def build_trades_file(s):
@@ -1026,33 +1091,54 @@ def trade_fail_msg(err):
 # ─────────────────────────────────────────────
 # КЛАВІАТУРА
 # ─────────────────────────────────────────────
+def is_asia_session() -> bool:
+    """Азія: 21:00-03:00 UTC (00:00-06:00 Київ +3)."""
+    h = datetime.datetime.now(datetime.timezone.utc).hour
+    return h >= 21 or h < 3
+
+def asia_status_label() -> str:
+    """Лейбл для кнопки статусу торгівлі."""
+    if is_asia_session():
+        now_kyiv = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=3)
+        return "Торгую  Азія  %s Київ" % now_kyiv.strftime("%H:%M")
+    else:
+        # Скільки до наступної Азії
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        h = now_utc.hour
+        if h < 21:
+            mins_left = (21 - h) * 60 - now_utc.minute
+        else:
+            mins_left = 0
+        if mins_left > 0:
+            return "Не торгую  —  до Азії %dгод %dхв" % (mins_left//60, mins_left%60)
+        return "Не торгую"
+
 def kb(s):
-    w="Гаманець: підключено" if s.ok   else "Підключити гаманець"
-    a="Авто: вимк"           if s.auto else "Авто: увімк"
+    w = "Гаманець: підключено" if s.ok else "Підключити гаманець"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(w,  callback_data="wallet"),
-         InlineKeyboardButton(a,  callback_data="auto_toggle")],
-        [InlineKeyboardButton("Баланс",       callback_data="balance"),
-         InlineKeyboardButton("Статистика",   callback_data="stats")],
-        [InlineKeyboardButton("Вінрейт Полі", callback_data="poly_wr"),
-         InlineKeyboardButton("Аналіз",       callback_data="analyze")],
-        [InlineKeyboardButton("Маркет",       callback_data="market"),
-         InlineKeyboardButton("Новини",       callback_data="news")],
-        [InlineKeyboardButton("Помилки",      callback_data="errors")],
+        [InlineKeyboardButton(w,              callback_data="wallet"),
+         InlineKeyboardButton("Баланс",       callback_data="balance")],
+        [InlineKeyboardButton("Статистика",   callback_data="stats"),
+         InlineKeyboardButton("Вінрейт Полі", callback_data="poly_wr")],
+        [InlineKeyboardButton("Аналіз",       callback_data="analyze"),
+         InlineKeyboardButton("Маркет",       callback_data="market")],
+        [InlineKeyboardButton("Новини",       callback_data="news"),
+         InlineKeyboardButton("Помилки",      callback_data="errors")],
+        [InlineKeyboardButton(asia_status_label(), callback_data="asia_status")],
     ])
 
 WELCOME=(
     "BTC Polymarket Bot\n\n"
-    "Сигнали кожні 15 хв  —  :00 :15 :30 :45 UTC\n"
-    "Ставка  —  13% від балансу  (мін. $1)\n"
-    "Позиції закриваються автоматично\n\n"
+    "Торгую тільки в Азію  —  21:00–03:00 UTC\n"
+    "Київ:  00:00–06:00\n"
+    "Ставка  —  13% від балансу  (мін. $1)\n\n"
     "Як підключити:\n\n"
     "1.  Натисни «Підключити гаманець»\n\n"
     "    Крок 1  —  Приватний ключ\n"
     "    polymarket.com → Profile → Export Private Key\n\n"
     "    Крок 2  —  Адреса гаманця\n"
     "    polymarket.com → Deposit → скопіюй адресу\n\n"
-    "2.  Натисни «Авто: увімк»"
+    "2.  Бот торгує автоматично в Азію сесію"
 )
 
 # ─────────────────────────────────────────────
@@ -1105,15 +1191,61 @@ async def on_callback(u,c):
             "Підключення гаманця\n\nКрок 1 / 2  —  Приватний ключ\n\n"
             "polymarket.com → Profile → Export Private Key\n\nВведи ключ (64 hex символи):")
 
-    elif q.data=="auto_toggle":
-        if not s.ok: await q.message.reply_text("Спочатку підключи гаманець."); return
-        if s.auto:
-            s.auto=False; await q.message.reply_text("Авто-торгівля вимкнена.",reply_markup=kb(s))
-        else:
-            s.auto=True; bal,_=get_balance(s); bet=s.bet_size(bal)
-            await q.message.reply_text(
-                "Авто-торгівля увімкнена\n\nБаланс: %s\nСтавка: $%.2f (13%%)"%(
-                    ("$%.2f"%bal) if bal else "перевіряємо...",bet),reply_markup=kb(s))
+    elif q.data=="asia_status":
+        # Детальна інформація про торгівлю в Азію
+        if not os.path.exists(POLY_WR_LOG):
+            await q.message.reply_text("Даних по торгівлі в Азію поки немає."); return
+        try:
+            with open(POLY_WR_LOG) as f: data_all = json.load(f)
+            # Переобчислюємо
+            for x in data_all:
+                x["result"]      = _classify_poly_result(x)
+                gross = x.get("gross_return",0); amt = x.get("amount",0)
+                x["real_profit"] = round(gross-amt,2)
+                x["real_pct"]    = round((gross-amt)/amt*100,1) if amt>0 else 0
+            if not data_all:
+                await q.message.reply_text("Даних по торгівлі в Азію поки немає."); return
+            wins_all   = [x for x in data_all if x["result"]=="WIN"]
+            total_in   = round(sum(x.get("amount",0) for x in data_all),2)
+            total_out  = round(sum(x.get("gross_return",0) for x in data_all),2)
+            total_pl   = round(total_out-total_in,2)
+            wr_all     = round(len(wins_all)/len(data_all)*100,1) if data_all else 0
+            # Час торгівлі в Київ
+            now_kyiv   = datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(hours=3)
+            lines = [
+                "Автоторгівля  —  тільки Азія",
+                "Активна:  21:00–03:00 UTC  (00:00–06:00 Київ)",
+                "",
+                "Зараз:  %s Київ  |  %s" % (
+                    now_kyiv.strftime("%H:%M"),
+                    "Торгую" if is_asia_session() else "Не торгую"),
+                "",
+                "Всього угод:     %d" % len(data_all),
+                "WIN:             %d" % len(wins_all),
+                "LOSS:            %d" % (len(data_all)-len(wins_all)),
+                "Вінрейт:         %.1f%%" % wr_all,
+                "",
+                "Вкладено всього: $%.2f" % total_in,
+                "Повернулось:     $%.2f" % total_out,
+                "P&L:             %s$%.2f" % ("+" if total_pl>=0 else "", total_pl),
+                "",
+                "Всі ставки:",
+            ]
+            for x in data_all[-20:]:
+                p    = x.get("real_profit",0)
+                sign = "+" if p>=0 else ""
+                t    = x.get("closed_at","")[:16].replace("T"," ")
+                ep   = x.get("entry_price",0)
+                sp   = x.get("sell_price",0)
+                amt  = x.get("amount",0)
+                lines.append(
+                    "  %s %s  $%.2f→$%.4f  entry=%.3f sell=%.3f  %s$%.2f  %s" % (
+                    x.get("direction","?"), x.get("result","?"),
+                    amt, x.get("gross_return",0), ep, sp,
+                    sign, abs(p), t))
+            await q.message.reply_text("\n".join(lines)[:4096])
+        except Exception as e:
+            await q.message.reply_text("Помилка: %s" % e)
 
     elif q.data=="balance":
         bal,err=get_balance(s)
@@ -1207,7 +1339,7 @@ async def on_message(u,c):
             await u.message.reply_text("Неправильна адреса (42 символи, починається з 0x).\nСпробуй ще раз:"); return
         s.state=None; key=s.tmp_key or ""; s.tmp_key=None
         clean=key.lower().replace("0x","").replace(" ","")
-        s.key="0x"+clean; s.funder=addr; s.ok=True; s._client=None
+        s.key="0x"+clean; s.funder=addr; s.ok=True; s.auto=True; s._client=None
         try:
             from eth_account import Account
             s.address=Account.from_key(s.key).address
@@ -1362,6 +1494,9 @@ async def scheduler(app):
         await asyncio.sleep(5)
         if _sessions:
             for uid,s in list(_sessions.items()):
+                if not is_asia_session():
+                    log.info("Поза Азією — пропускаємо цикл uid=%d", uid)
+                    continue
                 try: await cycle(app,s)
                 except Exception as e: log.error("Цикл uid=%d: %s",uid,e)
 
