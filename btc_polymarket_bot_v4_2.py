@@ -968,97 +968,93 @@ def lsr():
 def get_news():
     import re
 
-    # Ключові слова для BTC-релевантних новин
-    btc_keys  = ["bitcoin","btc","crypto","fed","rate","inflation","dollar","usd",
-                 "trump","tariff","sec","etf","coinbase","binance","blackrock",
-                 "treasury","powell","macro","recession","gdp","cpi","fomc",
-                 "interest rate","debt","sanctions","war","china","iran","stock"]
-    bull_keys = ["bull","surge","rally","etf","rise","gain","ath","high","buy",
-                 "approve","cut rate","stimulus","inflow","adoption"]
-    bear_keys = ["bear","drop","crash","dump","ban","sell","fear","hack","risk",
-                 "hike","tighten","restrict","sanction","seizure","collapse"]
+    # Ключові теми що ПРЯМО впливають на BTC
+    MUST_KEYS = [
+        "bitcoin","btc","crypto","fed ","federal reserve","interest rate",
+        "trump","tariff","inflation","cpi","fomc","powell","rate cut","rate hike",
+        "sec ","etf","blackrock","coinbase","binance","tether","usdt",
+        "dollar","dxy","treasury","debt ceiling","recession","gdp",
+        "china","iran","sanctions","war","stock market","s&p","nasdaq",
+        "macro","liquidity","risk-on","risk-off","halving","mining",
+    ]
+    BULL = ["bull","surge","rally","rise","gain","ath","approve","inflow",
+            "adoption","cut rate","stimulus","pump","recover","breakout"]
+    BEAR = ["bear","crash","drop","dump","ban","hack","risk","hike","restrict",
+            "sanction","seizure","collapse","fear","sell-off","breakdown"]
 
-    def is_relevant(title):
+    def is_btc_relevant(title):
         t = title.lower()
-        return any(k in t for k in btc_keys)
+        return any(k in t for k in MUST_KEYS)
 
     def sentiment(title):
         t = title.lower()
-        p = sum(1 for k in bull_keys if k in t)
-        n = sum(1 for k in bear_keys if k in t)
+        p = sum(1 for k in BULL if k in t)
+        n = sum(1 for k in BEAR if k in t)
         return "+" if p > n else "-" if n > p else "~"
 
-    def parse_rss(text, need_filter=False):
+    def parse_rss_titles(text):
         titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>", text)
         if not titles:
             titles = re.findall(r"<title>(.*?)</title>", text)
-        lines = []
-        for title in titles[1:]:  # пропускаємо перший (назва сайту)
-            title = re.sub(r"<[^>]+>", "", title).strip()
-            if not title or len(title) < 10: continue
-            if need_filter and not is_relevant(title): continue
-            lines.append("[%s] %s" % (sentiment(title), title[:72]))
-            if len(lines) >= 5: break
-        return lines
+        result = []
+        for t in titles:
+            t = re.sub(r"<[^>]+>","", t).strip()
+            if t and len(t) > 15:
+                result.append(t)
+        return result[1:]  # пропускаємо першу (назва каналу)
 
-    all_lines = []
+    collected = []
 
-    # 1. cryptocurrency.cv — BTC новини
-    try:
-        r = requests.get("https://cryptocurrency.cv/api/news",
-                         params={"tickers":"BTC","limit":3}, timeout=8)
-        if r.status_code == 200:
-            data = r.json()
-            articles = data.get("articles", data if isinstance(data,list) else [])
-            for item in articles[:3]:
-                t = item.get("title","") or item.get("headline","")
-                if t: all_lines.append("[%s] %s" % (sentiment(t), t[:72]))
-    except: pass
-
-    # 2. Bitcoin Magazine RSS
+    # 1. Bitcoin Magazine — завжди BTC-релевантні
     try:
         r = requests.get("https://bitcoinmagazine.com/feed", timeout=8)
         if r.status_code == 200:
-            lines = parse_rss(r.text, need_filter=False)
-            all_lines += lines[:2]
+            for t in parse_rss_titles(r.text)[:8]:
+                collected.append(("[%s] %s" % (sentiment(t), t[:72]), 1))
     except: pass
 
-    # 3. Reuters Business/Finance RSS (макро — Fed, Trump, тарифи)
+    # 2. Reuters Business — макро (Fed, тарифи, Трамп, ринки)
     try:
         r = requests.get("https://feeds.reuters.com/reuters/businessNews", timeout=8)
         if r.status_code == 200:
-            lines = parse_rss(r.text, need_filter=True)
-            all_lines += lines[:2]
+            for t in parse_rss_titles(r.text)[:15]:
+                if is_btc_relevant(t):
+                    collected.append(("[%s] %s" % (sentiment(t), t[:72]), 2))
     except: pass
 
-    # 4. Reuters Top News (геополітика, ринки)
+    # 3. Reuters Top News — геополітика що впливає на ризик-апетит
     try:
         r = requests.get("https://feeds.reuters.com/reuters/topNews", timeout=8)
         if r.status_code == 200:
-            lines = parse_rss(r.text, need_filter=True)
-            all_lines += lines[:2]
+            for t in parse_rss_titles(r.text)[:15]:
+                if is_btc_relevant(t):
+                    collected.append(("[%s] %s" % (sentiment(t), t[:72]), 2))
     except: pass
 
-    # 5. CoinDesk RSS — резерв
-    if len(all_lines) < 3:
-        try:
-            r = requests.get("https://coindesk.com/arc/outboundfeeds/rss/", timeout=8)
-            if r.status_code == 200:
-                lines = parse_rss(r.text, need_filter=False)
-                all_lines += lines[:3]
-        except: pass
+    # 4. cryptocurrency.cv — крипто новини
+    try:
+        r = requests.get("https://cryptocurrency.cv/api/news",
+                         params={"tickers":"BTC","limit":5}, timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            articles = data.get("articles", data if isinstance(data,list) else [])
+            for item in articles[:5]:
+                t = item.get("title","") or item.get("headline","")
+                if t and is_btc_relevant(t):
+                    collected.append(("[%s] %s" % (sentiment(t), t[:72]), 1))
+    except: pass
 
-    if all_lines:
-        # Дедупліцуємо і повертаємо топ-5
-        seen = set()
-        unique = []
-        for line in all_lines:
-            key = line[4:30]
-            if key not in seen:
-                seen.add(key); unique.append(line)
-        return "\n".join(unique[:6])
+    # Дедупліцуємо і беремо топ-6
+    seen = set()
+    lines = []
+    for line, priority in sorted(collected, key=lambda x: x[1]):
+        key = line[4:35].lower()
+        if key not in seen:
+            seen.add(key)
+            lines.append(line)
+        if len(lines) >= 6: break
 
-    return "Новини: недоступні"
+    return "\n".join(lines) if lines else "Новини: недоступні"
 
 # ─────────────────────────────────────────────
 # SMC
@@ -1293,11 +1289,15 @@ def analyze_with_ai(p,s):
         st=p["struct"]; ctx=p["ctx"]; mn=p["manip"]; ad=p["amd"]
         sw15=liq.get("sw15",{}); sw5=liq.get("sw5",{}); sw1=liq.get("sw1",{})
         bc5=liq.get("bos5"); f5a=liq.get("f5a"); f5b=liq.get("f5b")
+        news=p.get("news","") or ""
+        # Коротко — тільки перші 3 новини щоб не роздувати контекст
+        news_short = " | ".join(l for l in news.split("\n") if l.strip())[:300]
         msg=("Time:%s Sess:%s Last:%s\nPRICE:$%.2f 15m:%+.4f%% 5m:%+.4f%% Mom3:%+.4f%% Mic:%+.4f%%\n"
              "STRUCT:15m=%s 5m=%s 1m=%s Reg:%s Vol:%s\nAMD:%s->%s conf=%d [%s]\n"
              "Sw15m:%s@%.2f(%dc) Sw5m:%s@%.2f(%dc) Sw1m:%s@%.2f(%dc)\n"
              "StopsUp:%.3f%% StopsDn:%.3f%% BOS5m:%s FVG5:up=%s dn=%s Trap:%s hint=%s\n"
-             "Fund:%+.6f(%s) LiqL:$%.0f LiqS:$%.0f Sig:%s\nOI:%+.4f%% Book:%s(%+.1f%%) L/S:%.3f(%s) CL:%.1f%%")%(
+             "Fund:%+.6f(%s) LiqL:$%.0f LiqS:$%.0f Sig:%s\nOI:%+.4f%% Book:%s(%+.1f%%) L/S:%.3f(%s) CL:%.1f%%\n"
+             "NEWS:%s")%(
             p["ts"],ctx["sess"],ctx["last"],pr["cur"],pr["chg15"],pr["chg5"],pr["mom3"],pr["mic"],
             st["15m"],st["5m"],st["1m"],ctx["reg"],ctx["vol"],
             ad.get("phase","NONE"),ad.get("dir","?"),ad.get("conf",0),ad.get("reason",""),
@@ -1309,7 +1309,8 @@ def analyze_with_ai(p,s):
             ("%.3f%%"%f5a["dist"]) if f5a else "none",("%.3f%%"%f5b["dist"]) if f5b else "none",
             mn["trap"],str(mn["hint"]),
             pos["fr"],pos["fs"],pos["ll"],pos["ls"],pos["lsig"],
-            pos["oic"],pos["ob"],pos["obi"],pos["lsrr"],pos["lsr"],pos["cl"])
+            pos["oic"],pos["ob"],pos["obi"],pos["lsrr"],pos["lsr"],pos["cl"],
+            news_short if news_short else "none")
         resp=client.chat.completions.create(
             model="gpt-4o",
             messages=[{"role":"system","content":SYS},{"role":"user","content":msg}],
