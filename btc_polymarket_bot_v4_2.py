@@ -966,18 +966,40 @@ def lsr():
     except: return {"ratio":1.0,"lp":50.0,"bias":"NEUTRAL"}
 
 def get_news():
+    # Спроба 1: CryptoCompare v1 (без категорій — більш стабільний endpoint)
     try:
-        d=sget("https://min-api.cryptocompare.com/data/v2/news/",{"categories":"BTC,Bitcoin","lTs":0})
-        if d and "Data" in d:
-            bkw=["bull","surge","rally","etf"]; skw=["bear","drop","crash","dump","ban"]
+        d = sget("https://min-api.cryptocompare.com/data/v2/news/",
+                 {"lang":"EN","categories":"BTC,Blockchain"}, t=10)
+        if d and isinstance(d, dict) and d.get("Data"):
+            bkw=["bull","surge","rally","etf","rise","pump","gain"]
+            skw=["bear","drop","crash","dump","ban","sell","fear"]
             lines=[]
             for item in d["Data"][:5]:
                 t=item.get("title","").lower()
                 p_=sum(1 for k in bkw if k in t); n=sum(1 for k in skw if k in t)
-                lines.append("[%s] %s"%("+" if p_>n else "-" if n>p_ else "~",item.get("title","")[:70]))
-            return "\n".join(lines)
+                lines.append("[%s] %s" % ("+" if p_>n else "-" if n>p_ else "~",
+                                          item.get("title","")[:70]))
+            if lines: return "\n".join(lines)
     except: pass
-    return "Новини недоступні"
+
+    # Спроба 2: CryptoCompare v1 простий endpoint
+    try:
+        d = sget("https://min-api.cryptocompare.com/data/news/",
+                 {"lang":"EN"}, t=10)
+        if d and isinstance(d, list):
+            bkw=["bitcoin","btc","bull","rally","etf"]
+            skw=["crash","dump","ban","bear","drop"]
+            lines=[]
+            for item in d[:5]:
+                t=item.get("title","").lower()
+                if "bitcoin" not in t and "btc" not in t: continue
+                p_=sum(1 for k in bkw if k in t); n=sum(1 for k in skw if k in t)
+                lines.append("[%s] %s" % ("+" if p_>n else "-" if n>p_ else "~",
+                                          item.get("title","")[:70]))
+            if lines: return "\n".join(lines)
+    except: pass
+
+    return "Новини: API недоступний"
 
 # ─────────────────────────────────────────────
 # SMC
