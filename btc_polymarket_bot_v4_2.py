@@ -1057,7 +1057,7 @@ def vol_class(c15):
 
 def session():
     h=datetime.datetime.now(datetime.timezone.utc).hour
-    if 7<=h<12:    return "LONDON",1
+    if 7<=h<12:   return "LONDON",1
     elif 12<=h<17: return "NY_OPEN",0
     elif 17<=h<21: return "NY_PM",0
     elif 21<=h or h<3: return "ASIA",0
@@ -1191,101 +1191,29 @@ def build_payload(s):
 # ─────────────────────────────────────────────
 # AI
 # ─────────────────────────────────────────────
-SYS="""You are an elite BTC short-term trader specializing in Polymarket 15-minute UP/DOWN markets.
-Your task: predict whether BTC price will be ABOVE or BELOW the Polymarket event strike price in 15 minutes.
-
-CRITICAL: The question is NOT "will BTC go up from Binance price" but "will BTC be ABOVE the Polymarket strike price at market close".
-Always reason relative to poly_strike (the Polymarket event opening price).
-
-CURRENT MARKET CONTEXT (April 2026):
-- BTC is range-bound $70K-$80K, consolidating after drop from $126K ATH
-- Market structure: accumulation phase, buyers absorb dips, sellers resist breakouts
-- Volatility is moderate, ranging markets dominate
-- Institutional demand present but no strong directional trend
-- Fear & Greed: Extreme Fear zone — fakeouts and sweeps are common
-
+SYS="""You are an elite BTC short-term trader. Predict UP or DOWN in 15 minutes on Polymarket.
+Analyze fresh every time. Do NOT repeat previous signal without new evidence.
 TIMEFRAMES: 15m=context | 5m=tactics | 1m=execution
-
-SCORING SYSTEM (learned from historical data):
-+3  AMD: MANIPULATION_DONE phase (70% winrate historically)
-+3  CHOP_ZONE trap detected (68% winrate — tight range, stops both sides)
-+2  SWEEP_TRAP_HIGH or SWEEP_TRAP_LOW confirmed (80% winrate)
-+2  CHoCH or BOS on 5m in signal direction
-+1  FVG pulling price toward target
-+1  LONDON or NY_OPEN session (more momentum)
--1  DEAD_HOURS session (less liquidity)
--2  Opposing sweep (SWEEP_HIGH when bullish / SWEEP_LOW when bearish)
--2  LONG_CASCADE or SHORT_SQUEEZE liquidity event against direction
--1  MANIPULATION phase with no trap (37% winrate — skip if only this)
-
-CHOP_ZONE detection: when dist_above ≈ dist_below and AMD is MANIPULATION or MANIPULATION_DONE
-— this is a high-probability setup as stops are hunted both sides before the real move
-
-STRENGTH: score>=5=HIGH | score 3-4=MEDIUM | score 1-2=LOW
-Skip LOW signals when confidence is unclear.
-
-OUTPUT JSON only:
-{"decision":"UP or DOWN",
- "strength":"HIGH or MEDIUM or LOW",
- "confidence_score":<int>,
- "market_condition":"TRENDING or RANGING or CHOPPY",
- "key_signal":"one sentence explaining the main signal",
- "logic":"2-3 sentences in Ukrainian explaining reasoning relative to poly_strike",
- "reasons":["r1","r2","r3"],
- "risk_note":"main risk or NONE",
- "poly_edge":"brief note on why price will be above/below poly_strike"}"""
+AMD: SWEEP_LOW+close_above=UP(+3) | SWEEP_HIGH+close_below=DOWN(+3) | SWEEP_HIGH+holds=UP(+1)
+SCORING: +3AMD | +2CHoCH/BOS/SQUEEZE | -2CASCADE | +1/-1 FVG/session
+STRENGTH: >=5=HIGH | 3-4=MEDIUM | 1-2=LOW
+OUTPUT JSON only: {"decision":"UP or DOWN","strength":"HIGH or MEDIUM or LOW","confidence_score":<int>,
+"market_condition":"TRENDING or RANGING or CHOPPY","key_signal":"one sentence",
+"logic":"2-3 sentences Ukrainian","reasons":["r1","r2","r3"],"risk_note":"risk or NONE"}"""
 
 def analyze_with_ai(p,s):
     try:
         client=OpenAI(api_key=OPENAI_API_KEY)
         liq=p["liq"]; pos=p["pos"]; pr=p["price"]
         st=p["struct"]; ctx=p["ctx"]; mn=p["manip"]; ad=p["amd"]
-        poly=p.get("poly",{})
         sw15=liq.get("sw15",{}); sw5=liq.get("sw5",{}); sw1=liq.get("sw1",{})
         bc5=liq.get("bos5"); f5a=liq.get("f5a"); f5b=liq.get("f5b")
-
-        # Chainlink дані
-        poly_strike   = poly.get("strike")
-        chainlink_cur = poly.get("chainlink_cur")
-        basis_cl      = poly.get("basis_cl", 0)
-        btc_vs_strike = poly.get("btc_vs_strike", 0)
-        cl_vs_strike  = poly.get("cl_vs_strike", 0)
-        yes_mid       = poly.get("yes_mid", 0.5)
-        poly_mkt_q    = poly.get("mkt_q","")
-        poly_diff     = poly.get("diff", 900)
-
-        # Рядок з контекстом Polymarket для AI
-        if poly_strike:
-            cl_str = ("$%.2f" % chainlink_cur) if chainlink_cur else "N/A"
-            strike_line = (
-                "PolyStrike(Chainlink):$%.2f  "
-                "Chainlink_now:%s  CL_vs_Strike:%+.2f  "
-                "Binance_now:$%.2f  Binance_vs_Strike:%+.2f  "
-                "Basis(BN-CL):%+.2f  "
-                "Market_YES:%.0f%%  TimeLeft:%.0fs"
-            ) % (
-                poly_strike,
-                cl_str, cl_vs_strike,
-                pr["cur"], btc_vs_strike,
-                basis_cl,
-                yes_mid * 100, poly_diff
-            )
-        else:
-            strike_line = "PolyStrike:N/A(fallback=Binance) YES:%.0f%% TimeLeft:%.0fs" % (
-                yes_mid*100, poly_diff)
-
-        msg=("Time:%s Sess:%s Last:%s\n"
-             "%s\n"
-             "PRICE:$%.2f 15m:%+.4f%% 5m:%+.4f%% Mom3:%+.4f%% Mic:%+.4f%%\n"
-             "STRUCT:15m=%s 5m=%s 1m=%s Reg:%s Vol:%s\n"
-             "AMD:%s->%s conf=%d [%s]\n"
+        msg=("Time:%s Sess:%s Last:%s\nPRICE:$%.2f 15m:%+.4f%% 5m:%+.4f%% Mom3:%+.4f%% Mic:%+.4f%%\n"
+             "STRUCT:15m=%s 5m=%s 1m=%s Reg:%s Vol:%s\nAMD:%s->%s conf=%d [%s]\n"
              "Sw15m:%s@%.2f(%dc) Sw5m:%s@%.2f(%dc) Sw1m:%s@%.2f(%dc)\n"
              "StopsUp:%.3f%% StopsDn:%.3f%% BOS5m:%s FVG5:up=%s dn=%s Trap:%s hint=%s\n"
-             "Fund:%+.6f(%s) LiqL:$%.0f LiqS:$%.0f Sig:%s\n"
-             "OI:%+.4f%% Book:%s(%+.1f%%) L/S:%.3f(%s) CL:%.1f%%")%(
-            p["ts"],ctx["sess"],ctx["last"],
-            strike_line,
-            pr["cur"],pr["chg15"],pr["chg5"],pr["mom3"],pr["mic"],
+             "Fund:%+.6f(%s) LiqL:$%.0f LiqS:$%.0f Sig:%s\nOI:%+.4f%% Book:%s(%+.1f%%) L/S:%.3f(%s) CL:%.1f%%")%(
+            p["ts"],ctx["sess"],ctx["last"],pr["cur"],pr["chg15"],pr["chg5"],pr["mom3"],pr["mic"],
             st["15m"],st["5m"],st["1m"],ctx["reg"],ctx["vol"],
             ad.get("phase","NONE"),ad.get("dir","?"),ad.get("conf",0),ad.get("reason",""),
             sw15.get("type","N"),sw15.get("level",0),sw15.get("ago",0),
@@ -1419,25 +1347,30 @@ def build_trades_file(s):
 # ПОВІДОМЛЕННЯ
 # ─────────────────────────────────────────────
 def signal_msg(dec,strength,score,price,mkt_cond,sess_name,key_sig,logic,reasons,poly=None):
-    arrow=("▲" if dec=="UP" else "▼")
-    str_label={"HIGH":"HIGH","MEDIUM":"MEDIUM","LOW":"LOW"}.get(strength,strength)
-    reas_s="\n".join("  · "+r for r in reasons[:3]) if reasons else ""
+    arrow     = "▲" if dec=="UP" else "▼"
+    str_label = {"HIGH":"HIGH","MEDIUM":"MEDIUM","LOW":"LOW"}.get(strength,strength)
+    reas_s    = "\n".join("  · "+r for r in reasons[:3]) if reasons else ""
     poly_line = ""
     if poly:
-        strike    = poly.get("strike")
-        cl_cur    = poly.get("chainlink_cur")
-        yes_mid   = poly.get("yes_mid", 0.5)
-        cl_vs_str = poly.get("cl_vs_strike", 0)
-        if strike:
-            cl_str = ("$%.2f" % cl_cur) if cl_cur else "?"
-            sign = "+" if cl_vs_str >= 0 else ""
-            poly_line = (
-                "\nStrike:  $%.2f  (Chainlink)"
-                "\nЗараз:   %s  (%s%.2f від strike)"
-                "\nРинок:   %.0f%% UP"
-            ) % (strike, cl_str, sign, cl_vs_str, yes_mid*100)
-        else:
-            poly_line = "\nStrike: завантажується...  Ринок: %.0f%% UP" % (yes_mid*100)
+        strike      = poly.get("strike")
+        chainlink   = poly.get("chainlink_cur")
+        cl_vs       = poly.get("cl_vs_strike", 0)
+        yes_mid     = poly.get("yes_mid", 0.5)
+        # Показуємо тільки якщо є реальний Chainlink (не fallback)
+        # і yes_mid відрізняється від 0.5 (ринок має думку)
+        has_cl = chainlink and chainlink > 0
+        has_strike = strike and strike != price  # не fallback
+        if has_strike and has_cl:
+            sign = "+" if cl_vs >= 0 else ""
+            poly_line = "\nStrike: $%.2f  Chainlink: $%.2f  (%s%.2f)" % (
+                strike, chainlink, sign, cl_vs)
+        elif has_strike:
+            poly_line = "\nStrike: $%.2f  (Polymarket)" % strike
+        # yes_mid показуємо тільки якщо відрізняється від 50% більше ніж на 5%
+        if abs(yes_mid - 0.5) > 0.05:
+            poly_line += "\nРинок: %.0f%% %s" % (
+                yes_mid*100 if yes_mid > 0.5 else (1-yes_mid)*100,
+                "UP" if yes_mid > 0.5 else "DOWN")
     return ("%s %s   %s   Score %+d\n\n$%.2f  ·  %s  ·  %s%s\n\n%s\n\n%s\n\n%s"
             ) % (arrow,dec,str_label,score,price,mkt_cond,sess_name,poly_line,key_sig,logic,reas_s)
 
@@ -1491,16 +1424,17 @@ def kb(s):
 
 WELCOME=(
     "BTC Polymarket Bot\n\n"
-    "Торгую тільки в Азію  —  21:00–03:00 UTC\n"
-    "Київ:  00:00–06:00\n"
+    "Сигнали кожні 15 хв  —  :00 :15 :30 :45 UTC\n"
     "Ставка  —  13% від балансу  (мін. $1)\n\n"
+    "Авто-торгівля:\n"
+    "  Вручну — вмикай коли хочеш, торгує в будь-яку сесію\n"
+    "  Азія (00:00-06:00 Київ) — вмикається автоматично\n\n"
     "Як підключити:\n\n"
     "1.  Натисни «Підключити гаманець»\n\n"
     "    Крок 1  —  Приватний ключ\n"
     "    polymarket.com → Profile → Export Private Key\n\n"
     "    Крок 2  —  Адреса гаманця\n"
-    "    polymarket.com → Deposit → скопіюй адресу\n\n"
-    "2.  Бот торгує автоматично в Азію сесію"
+    "    polymarket.com → Deposit → скопіюй адресу"
 )
 
 # ─────────────────────────────────────────────
@@ -1559,9 +1493,23 @@ async def on_callback(u,c):
     elif q.data=="auto_toggle":
         if not s.ok: await q.message.reply_text("Спочатку підключи гаманець."); return
         s.auto = not s.auto
-        state_txt = "увімкнена" if s.auto else "вимкнена"
-        note = " (автоматично увімкнеться в Азію)" if not s.auto else " (торгує тільки в Азію)"
-        await q.message.reply_text("Авто-торгівля %s%s" % (state_txt, note), reply_markup=kb(s))
+        if s.auto:
+            s._asia_auto = False  # вмикали вручну — не вимикати автоматично
+            bal,_ = get_balance(s); bet = s.bet_size(bal)
+            sess_note = "Зараз торгую" if is_asia_session() else "Буду торгувати з наступного сигналу"
+            await q.message.reply_text(
+                "Авто-торгівля увімкнена\n\n"
+                "Баланс: $%.2f\nСтавка: $%.2f (13%%)\n\n"
+                "%s\n"
+                "В Азію вмикається автоматично завжди." % (
+                    bal or 0, bet, sess_note),
+                reply_markup=kb(s))
+        else:
+            s._asia_auto = False  # скидаємо флаг авто-Азії
+            await q.message.reply_text(
+                "Авто-торгівля вимкнена.\n\n"
+                "В Азію (00:00-06:00 Київ) увімкнеться автоматично.",
+                reply_markup=kb(s))
 
     elif q.data=="asia_status":
         # Детальна інформація про торгівлю в Азію
@@ -1890,19 +1838,28 @@ async def cycle(app,s):
                    p.get("poly",{}))
     print("[Cycle] uid=%d auto=%s dec=%s str=%s sess=%s"%(s.uid,s.auto,dec,strength,p["ctx"]["sess"]))
 
-    # Автоматично вмикаємо авто в Азію, вимикаємо після
-    if is_asia_session() and not s.auto and s.ok:
+    asia = is_asia_session()
+
+    # Авто-вмикання на початку Азії
+    if asia and not s.auto and s.ok:
+        s._asia_auto = True   # флаг що вмикали автоматично
         s.auto = True
         await app.bot.send_message(chat_id=s.uid,
-            text="Азія сесія — авто-торгівля увімкнена")
+            text="Азія сесія розпочалась — авто-торгівля увімкнена\n(00:00–06:00 Київ)")
 
-    if s.auto and is_asia_session():
-        # В Азію — надсилаємо сигнал і торгуємо
-        await app.bot.send_message(chat_id=s.uid, text=txt)
+    # Авто-вимикання після Азії — тільки якщо МИ вмикали автоматично
+    if not asia and s.auto and getattr(s, "_asia_auto", False):
+        s._asia_auto = False
+        s.auto = False
+        await app.bot.send_message(chat_id=s.uid,
+            text="Азія сесія завершилась — авто-торгівля вимкнена")
+
+    # Надсилаємо сигнал завжди
+    await app.bot.send_message(chat_id=s.uid, text=txt)
+
+    # Торгуємо якщо авто увімкнено (вручну або автоматично)
+    if s.auto:
         await auto_trade(app,s,p,result)
-    else:
-        # Поза Азією — тільки сигнал, без ставки
-        await app.bot.send_message(chat_id=s.uid, text=txt)
 
 # ─────────────────────────────────────────────
 # ПЛАНУВАЛЬНИК + ВОТЧЕРИ
