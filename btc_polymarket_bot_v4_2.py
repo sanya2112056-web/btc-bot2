@@ -630,6 +630,72 @@ async def check_open_bets(app, s):
         if not should_sell:
             still_open.append(bet); continue
 
+        # ── РИНОК ЗАКРИВСЯ (ціна = 0, час вийшов) ──────────────────
+        # НЕ намагаємось продати за 0.01.
+        # Чекаємо щоб Polymarket зробив redeem, потім звіряємо баланс.
+        if cur_price == 0.0 and time_left <= 0:
+            # Чекаємо 45 сек щоб redeem встиг прийти
+            print("[Check] Market closed uid=%d bet=%s — waiting for redeem..." % (s.uid, bet_id[:8]))
+            await asyncio.sleep(45)
+
+            bal_before  = bet.get("bal_before", 0)
+            bal_after, _= get_balance(s)
+            bal_after   = bal_after or 0
+
+            # Реальний результат = скільки прийшло на баланс після ставки
+            # bal_after = bal_before - amount + повернення
+            # повернення = bal_after - bal_before + amount
+            returned    = round(bal_after - bal_before + amount, 2)
+            profit      = round(returned - amount, 2)
+            profit_pct  = round(profit / amount * 100, 1) if amount > 0 else 0
+            poly_result = "WIN" if profit > 0 else "LOSS"
+            sign        = "+" if profit >= 0 else ""
+            arrow       = "▲" if direction=="UP" else "▼"
+
+            print("[BalCheck] uid=%d before=$%.2f after=$%.2f returned=$%.2f profit=%s$%.2f" % (
+                s.uid, bal_before, bal_after, returned, sign, abs(profit)))
+
+            closed_record = {
+                "bet_id":       bet_id,
+                "direction":    direction,
+                "mkt":          mkt,
+                "amount":       amount,
+                "size":         size,
+                "entry_price":  entry,
+                "sell_price":   0.0,
+                "cur_price":    0.0,
+                "gross_return": returned,
+                "profit":       profit,
+                "profit_pct":   profit_pct,
+                "result":       poly_result,
+                "close_reason": "redeem (balance check)",
+                "bal_before":   bal_before,
+                "bal_after":    bal_after,
+                "closed_at":    datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "strength":     bet.get("strength",""),
+                "score":        bet.get("score",0),
+                "session":      bet.get("session",""),
+                "amd_phase":    bet.get("amd_phase",""),
+            }
+            poly_log_closed(closed_record)
+            poly_stats_update(bet_id, {"status":"CLOSED_REDEEM","close_data":closed_record})
+
+            msg = (
+                "Маркет закрито  %s %s\n\n"
+                "%s\n\n"
+                "Баланс до:      $%.2f\n"
+                "Баланс після:   $%.2f\n"
+                "Повернулось:    $%.2f\n"
+                "Ставка була:    $%.2f\n"
+                "P&L:            %s$%.2f  (%s%.1f%%)\n"
+                "Результат:      %s"
+            ) % (arrow, direction, mkt[:55],
+                 bal_before, bal_after, returned, amount,
+                 sign, abs(profit), sign, abs(profit_pct),
+                 poly_result)
+            await app.bot.send_message(chat_id=s.uid, text=msg)
+            continue  # ставка закрита, не додаємо в still_open
+
         result = force_sell(s, token_id, size, mode=sell_mode)
 
         if result["ok"]:
@@ -1387,6 +1453,7 @@ async def auto_trade(app,s,p,result):
             "entry_price": bet["price"],
             "placed_at":   time.time(),
             "market_end":  bet.get("market_end",time.time()+900),
+            "bal_before":  bal,   # баланс ДО ставки — для порівняння після
             "mkt":         bet.get("mkt",""),
             "strength":    strength,
             "logic":       logic,
