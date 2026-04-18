@@ -966,40 +966,99 @@ def lsr():
     except: return {"ratio":1.0,"lp":50.0,"bias":"NEUTRAL"}
 
 def get_news():
-    # Спроба 1: CryptoCompare v1 (без категорій — більш стабільний endpoint)
+    import re
+
+    # Ключові слова для BTC-релевантних новин
+    btc_keys  = ["bitcoin","btc","crypto","fed","rate","inflation","dollar","usd",
+                 "trump","tariff","sec","etf","coinbase","binance","blackrock",
+                 "treasury","powell","macro","recession","gdp","cpi","fomc",
+                 "interest rate","debt","sanctions","war","china","iran","stock"]
+    bull_keys = ["bull","surge","rally","etf","rise","gain","ath","high","buy",
+                 "approve","cut rate","stimulus","inflow","adoption"]
+    bear_keys = ["bear","drop","crash","dump","ban","sell","fear","hack","risk",
+                 "hike","tighten","restrict","sanction","seizure","collapse"]
+
+    def is_relevant(title):
+        t = title.lower()
+        return any(k in t for k in btc_keys)
+
+    def sentiment(title):
+        t = title.lower()
+        p = sum(1 for k in bull_keys if k in t)
+        n = sum(1 for k in bear_keys if k in t)
+        return "+" if p > n else "-" if n > p else "~"
+
+    def parse_rss(text, need_filter=False):
+        titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>", text)
+        if not titles:
+            titles = re.findall(r"<title>(.*?)</title>", text)
+        lines = []
+        for title in titles[1:]:  # пропускаємо перший (назва сайту)
+            title = re.sub(r"<[^>]+>", "", title).strip()
+            if not title or len(title) < 10: continue
+            if need_filter and not is_relevant(title): continue
+            lines.append("[%s] %s" % (sentiment(title), title[:72]))
+            if len(lines) >= 5: break
+        return lines
+
+    all_lines = []
+
+    # 1. cryptocurrency.cv — BTC новини
     try:
-        d = sget("https://min-api.cryptocompare.com/data/v2/news/",
-                 {"lang":"EN","categories":"BTC,Blockchain"}, t=10)
-        if d and isinstance(d, dict) and d.get("Data"):
-            bkw=["bull","surge","rally","etf","rise","pump","gain"]
-            skw=["bear","drop","crash","dump","ban","sell","fear"]
-            lines=[]
-            for item in d["Data"][:5]:
-                t=item.get("title","").lower()
-                p_=sum(1 for k in bkw if k in t); n=sum(1 for k in skw if k in t)
-                lines.append("[%s] %s" % ("+" if p_>n else "-" if n>p_ else "~",
-                                          item.get("title","")[:70]))
-            if lines: return "\n".join(lines)
+        r = requests.get("https://cryptocurrency.cv/api/news",
+                         params={"tickers":"BTC","limit":3}, timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            articles = data.get("articles", data if isinstance(data,list) else [])
+            for item in articles[:3]:
+                t = item.get("title","") or item.get("headline","")
+                if t: all_lines.append("[%s] %s" % (sentiment(t), t[:72]))
     except: pass
 
-    # Спроба 2: CryptoCompare v1 простий endpoint
+    # 2. Bitcoin Magazine RSS
     try:
-        d = sget("https://min-api.cryptocompare.com/data/news/",
-                 {"lang":"EN"}, t=10)
-        if d and isinstance(d, list):
-            bkw=["bitcoin","btc","bull","rally","etf"]
-            skw=["crash","dump","ban","bear","drop"]
-            lines=[]
-            for item in d[:5]:
-                t=item.get("title","").lower()
-                if "bitcoin" not in t and "btc" not in t: continue
-                p_=sum(1 for k in bkw if k in t); n=sum(1 for k in skw if k in t)
-                lines.append("[%s] %s" % ("+" if p_>n else "-" if n>p_ else "~",
-                                          item.get("title","")[:70]))
-            if lines: return "\n".join(lines)
+        r = requests.get("https://bitcoinmagazine.com/feed", timeout=8)
+        if r.status_code == 200:
+            lines = parse_rss(r.text, need_filter=False)
+            all_lines += lines[:2]
     except: pass
 
-    return "Новини: API недоступний"
+    # 3. Reuters Business/Finance RSS (макро — Fed, Trump, тарифи)
+    try:
+        r = requests.get("https://feeds.reuters.com/reuters/businessNews", timeout=8)
+        if r.status_code == 200:
+            lines = parse_rss(r.text, need_filter=True)
+            all_lines += lines[:2]
+    except: pass
+
+    # 4. Reuters Top News (геополітика, ринки)
+    try:
+        r = requests.get("https://feeds.reuters.com/reuters/topNews", timeout=8)
+        if r.status_code == 200:
+            lines = parse_rss(r.text, need_filter=True)
+            all_lines += lines[:2]
+    except: pass
+
+    # 5. CoinDesk RSS — резерв
+    if len(all_lines) < 3:
+        try:
+            r = requests.get("https://coindesk.com/arc/outboundfeeds/rss/", timeout=8)
+            if r.status_code == 200:
+                lines = parse_rss(r.text, need_filter=False)
+                all_lines += lines[:3]
+        except: pass
+
+    if all_lines:
+        # Дедупліцуємо і повертаємо топ-5
+        seen = set()
+        unique = []
+        for line in all_lines:
+            key = line[4:30]
+            if key not in seen:
+                seen.add(key); unique.append(line)
+        return "\n".join(unique[:6])
+
+    return "Новини: недоступні"
 
 # ─────────────────────────────────────────────
 # SMC
@@ -1187,6 +1246,9 @@ def build_payload(s):
     except Exception as e:
         print("[Payload] mkt err: %s" % e)
 
+    # Новини для AI (кешуємо щоб не робити запит кожні 15 хв без потреби)
+    news_str = get_news()
+
     return {
         "ts":datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "ts_unix":int(time.time()),
@@ -1198,13 +1260,14 @@ def build_payload(s):
                "exh":lq["exh"],"oi":oi,"oic":oic,"ob":ob["bias"],"obi":ob["imb"],
                "lsr":ls["bias"],"lsrr":ls["ratio"],"cl":ls["lp"]},
         "ctx":{"vol":vc,"vs":vs,"sess":sess_name,"sb2":sb2,"reg":reg,"last":last_s},
+        "news": news_str,
         "poly":{
-            "strike":      poly_strike,     # Chainlink strike (сіра ціна Polymarket)
-            "chainlink_cur": chainlink_cur, # жива Chainlink ціна
-            "basis_cl":    basis_cl,        # різниця Binance vs Chainlink
-            "btc_vs_strike": btc_vs_strike, # Binance ціна відносно strike
-            "cl_vs_strike":  cl_vs_strike,  # Chainlink ціна відносно strike
-            "yes_mid":     poly_yes_mid,    # ймовірність UP за ринком
+            "strike":      poly_strike,
+            "chainlink_cur": chainlink_cur,
+            "basis_cl":    basis_cl,
+            "btc_vs_strike": btc_vs_strike,
+            "cl_vs_strike":  cl_vs_strike,
+            "yes_mid":     poly_yes_mid,
             "mkt_q":       poly_mkt_q,
             "diff":        poly_mkt_diff,
         },
