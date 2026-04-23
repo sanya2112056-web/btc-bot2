@@ -138,7 +138,182 @@ def get_token_price(token_id):
     return 0.0
 
 # ─────────────────────────────────────────────
-# POLY STATS / WINRATE
+# POLY WINRATE — через зміну балансу (v6 логіка)
+#
+# При кожній ставці зберігаємо bal_before.
+# При наступній ставці знімаємо поточний баланс (bal_after),
+# profit = bal_after - bal_before — це реальний P&L попередньої ставки.
+# ─────────────────────────────────────────────
+def poly_wr_add(uid, bet_id, direction, amount, bal_before, strength, session_name):
+    """Записує нову ставку у winrate лог (bal_after = null)."""
+    record = {
+        "bet_id":      bet_id,
+        "uid":         uid,
+        "direction":   direction,
+        "amount":      amount,
+        "bal_before":  bal_before,
+        "bal_after":   None,
+        "profit":      None,
+        "result":      None,
+        "strength":    strength,
+        "session":     session_name,
+        "placed_at":   datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "resolved_at": None,
+    }
+    try:
+        data = []
+        if os.path.exists(POLY_WR):
+            with open(POLY_WR) as f: data = json.load(f)
+        data.append(record)
+        data = data[-1000:]
+        with open(POLY_WR, "w") as f: json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("[WR add] %s" % e)
+
+def poly_wr_resolve(uid, new_bal):
+    """
+    Знаходить останній незакритий запис цього юзера і закриває його.
+    new_bal — поточний баланс до списання нової ставки.
+    profit = new_bal - bal_before.
+    """
+    try:
+        if not os.path.exists(POLY_WR): return None
+        with open(POLY_WR) as f: data = json.load(f)
+        for rec in reversed(data):
+            if rec.get("uid") == uid and rec.get("bal_after") is None:
+                bal_before         = rec.get("bal_before", new_bal)
+                profit             = round(new_bal - bal_before, 2)
+                rec["bal_after"]   = new_bal
+                rec["profit"]      = profit
+                rec["result"]      = "WIN" if profit > 0 else "LOSS"
+                rec["resolved_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                with open(POLY_WR, "w") as f: json.dump(data, f, ensure_ascii=False, indent=2)
+                print("[WR resolve] bet=%s profit=%+.2f result=%s" % (
+                    rec.get("bet_id","?")[:8], profit, rec["result"]))
+                return rec
+        return None
+    except Exception as e:
+        print("[WR resolve] %s" % e)
+        return None
+
+def poly_winrate_msg(uid):
+    if not os.path.exists(POLY_WR):
+        return "Polymarket\n\nДаних поки немає."
+    try:
+        with open(POLY_WR) as f: data = json.load(f)
+        my = [x for x in data if x.get("uid") == uid]
+        if not my:
+            return "Polymarket\n\nДаних поки немає."
+
+        resolved = [x for x in my if x.get("bal_after") is not None]
+        pending  = [x for x in my if x.get("bal_after") is None]
+
+        if not resolved:
+            return ("Polymarket\n\nВ очікуванні: %d ставок\n"
+                    "Результат з'явиться після наступної ставки." % len(pending))
+
+        total    = len(resolved)
+        wins     = [x for x in resolved if x.get("result") == "WIN"]
+        losses   = [x for x in resolved if x.get("result") == "LOSS"]
+        total_in = round(sum(x.get("amount", 0) for x in resolved), 2)
+        total_pl = round(sum(x.get("profit", 0) for x in resolved), 2)
+        wr       = round(len(wins) / total * 100, 1) if total else 0
+        roi      = round(total_pl / total_in * 100, 1) if total_in > 0 else 0
+        avg_win  = round(sum(x["profit"] for x in wins) / len(wins), 2) if wins else 0
+        avg_loss = round(sum(x["profit"] for x in losses) / len(losses), 2) if losses else 0
+
+        # Поточна серія
+        streak = 0; streak_type = ""
+        for x in reversed(resolved):
+            r = x.get("result", "")
+            if streak == 0: streak_type = r
+            if r == streak_type: streak += 1
+            else: break
+
+        last_bal = resolved[-1].get("bal_after", 0)
+
+        lines = [
+            "Polymarket  P&L",
+            "",
+            "Угоди        %d   WIN %d   LOSS %d" % (total, len(wins), len(losses)),
+            "Вінрейт      %.1f%%" % wr,
+            "Серія        %d %s поспіль" % (streak, streak_type),
+            "",
+            "Вкладено     $%.2f" % total_in,
+            "P&L          %s$%.2f" % ("+" if total_pl >= 0 else "", total_pl),
+            "ROI          %s%.1f%%" % ("+" if roi >= 0 else "", roi),
+            "Сер. WIN     +$%.2f" % avg_win,
+            "Сер. LOSS    $%.2f" % avg_loss,
+            "Баланс зараз $%.2f" % last_bal,
+            "",
+            "Журнал ставок",
+            "",
+        ]
+
+        for x in reversed(resolved[-20:]):
+            p     = x.get("profit", 0)
+            sign  = "+" if p >= 0 else ""
+            res   = x.get("result", "")
+            t     = (x.get("resolved_at") or x.get("placed_at") or "")[:16].replace("T", " ")
+            d     = x.get("direction", "")
+            amt   = x.get("amount", 0)
+            b_bef = x.get("bal_before", 0)
+            b_aft = x.get("bal_after", 0)
+            st    = x.get("strength", "")[:1]
+            lines.append(
+                "%s  %s  %s  $%.2f  %s$%.2f  bal %.2f->%.2f  %s" % (
+                    t, d, res, amt, sign, abs(p),
+                    b_bef if b_bef else 0,
+                    b_aft if b_aft else 0,
+                    st
+                )
+            )
+
+        if pending:
+            lines += ["", "В очікуванні: %d ставка" % len(pending)]
+
+        return "\n".join(lines)
+    except Exception as e:
+        return "Помилка: %s" % e
+
+# ─────────────────────────────────────────────
+# ІНВЕРСІЯ СИГНАЛУ — на основі аналізу даних
+#
+# Умова 1: ASK_HEAVY + UP → реально йде DOWN (0% вінрейт на даних)
+# Умова 2: BID_HEAVY + DOWN → реально йде UP (25% вінрейт = 75% при інверсії)
+# Умова 3: AMD direction проти сигналу → AMD правий у 78% випадків
+#
+# Якщо хоча б одна умова виконана — інвертуємо напрямок і повідомляємо юзера.
+# ─────────────────────────────────────────────
+def maybe_invert(dec, ob_bias, amd_dir, score):
+    """
+    Перевіряє умови інверсії.
+    Повертає (final_dec, inverted, reason_str).
+    inverted=True означає що напрямок був змінений.
+    """
+    reasons = []
+
+    # Умова 1+2: ордербук суперечить сигналу
+    ob_contra = (ob_bias == "ASK_HEAVY" and dec == "UP") or \
+                (ob_bias == "BID_HEAVY" and dec == "DOWN")
+
+    # Умова 3: AMD direction відомий і суперечить сигналу
+    amd_contra = (amd_dir and amd_dir not in ("", "None", None) and amd_dir != dec)
+
+    if ob_contra:
+        reasons.append("OB %s contra %s" % (ob_bias, dec))
+    if amd_contra:
+        reasons.append("AMD->%s contra %s" % (amd_dir, dec))
+
+    if not reasons:
+        return dec, False, ""
+
+    new_dec = "DOWN" if dec == "UP" else "UP"
+    reason_str = " + ".join(reasons)
+    return new_dec, True, reason_str
+
+# ─────────────────────────────────────────────
+# POLY STATS (для сумісності зі старими даними)
 # ─────────────────────────────────────────────
 def poly_stats_update(bet_id, update):
     try:
@@ -156,61 +331,6 @@ def poly_stats_get_all():
             with open(POLY_STATS) as f: return list(json.load(f).values())
     except: pass
     return []
-
-def poly_log_closed(record):
-    try:
-        data = []
-        if os.path.exists(POLY_WR):
-            with open(POLY_WR) as f: data = json.load(f)
-        data.append(record); data = data[-500:]
-        with open(POLY_WR,"w") as f: json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e: print("[PolyWR] %s" % e)
-
-def _classify(record):
-    sp  = record.get("sell_price",0)
-    gr  = record.get("gross_return",0)
-    amt = record.get("amount",0)
-    rsn = record.get("close_reason","")
-    if sp >= 0.80 or "прибуток" in rsn: return "WIN"
-    if amt > 0 and gr > amt: return "WIN"
-    return "LOSS"
-
-def poly_winrate_msg():
-    if not os.path.exists(POLY_WR):
-        return "Polymarket вінрейт\n\nДаних поки немає."
-    try:
-        with open(POLY_WR) as f: data = json.load(f)
-        if not data: return "Polymarket вінрейт\n\nДаних поки немає."
-        for x in data:
-            x["result"] = _classify(x)
-            gr=x.get("gross_return",0); amt=x.get("amount",0)
-            x["rp"] = round(gr-amt,2)
-            x["rpc"]= round((gr-amt)/amt*100,1) if amt>0 else 0
-        total     = len(data)
-        wins      = [x for x in data if x["result"]=="WIN"]
-        tin       = round(sum(x.get("amount",0) for x in data),2)
-        tout      = round(sum(x.get("gross_return",0) for x in data),2)
-        tpl       = round(tout-tin,2)
-        wr        = round(len(wins)/total*100,1) if total else 0
-        bar       = "▓"*int(wr/5)+"░"*(20-int(wr/5))
-        roi       = round(tpl/tin*100,1) if tin>0 else 0
-        lines=[
-            "Polymarket вінрейт","",
-            "Всього: %d  WIN: %d  LOSS: %d" % (total,len(wins),total-len(wins)),
-            "Вінрейт: %.1f%%  [%s]" % (wr,bar),"",
-            "Вкладено:    $%.2f" % tin,
-            "Повернулось: $%.2f" % tout,
-            "P&L:         %s$%.2f" % ("+" if tpl>=0 else "",tpl),
-            "ROI:         %s%.1f%%" % ("+" if roi>=0 else "",roi),"",
-            "Останні угоди:",
-        ]
-        for x in data[-10:]:
-            p=x.get("rp",0); sign="+" if p>=0 else ""
-            t=x.get("closed_at","")[:16].replace("T"," ")
-            lines.append("  %s %s %s$%.2f sell=%.3f %s" % (
-                x.get("direction","?"),x.get("result","?"),sign,abs(p),x.get("sell_price",0),t))
-        return "\n".join(lines)
-    except Exception as e: return "Помилка: %s" % e
 
 # ─────────────────────────────────────────────
 # CSV + JSON ФАЙЛ СТАТИСТИКИ
@@ -246,6 +366,7 @@ def build_stats_files(s):
         "liq_long","liq_short","liq_signal",
         "ob_bias","ob_imb","lsr_ratio","lsr_bias","crowd_long_pct",
         "consecutive_same","risk_note",
+        "inverted","invert_reason",
     ]
     csv_buf = io.StringIO()
     writer  = csv.DictWriter(csv_buf, fieldnames=CSV_COLS, extrasaction="ignore")
@@ -303,6 +424,8 @@ def build_stats_files(s):
             "crowd_long_pct":   sig.get("cl",0),
             "consecutive_same": sig.get("consec",0),
             "risk_note":        sig.get("risk_note",""),
+            "inverted":         sig.get("inverted", False),
+            "invert_reason":    sig.get("invert_reason", ""),
         }
         writer.writerow(row)
     csv_bytes = io.BytesIO(csv_buf.getvalue().encode("utf-8"))
@@ -490,15 +613,9 @@ async def check_open_bets(app, s):
             result="WIN" if profit>0 else "LOSS"
             sign="+" if profit>=0 else ""
             arrow="▲" if direction=="UP" else "▼"
-            closed={"bet_id":bet_id,"direction":direction,"mkt":mkt,"amount":amount,"size":size,
-                    "entry_price":entry,"sell_price":0.0,"cur_price":0.0,"gross_return":returned,
-                    "profit":profit,"profit_pct":pct,"result":result,"close_reason":"redeem",
-                    "bal_before":bal_before,"bal_after":bal_after,
-                    "closed_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                    "strength":bet.get("strength",""),"score":bet.get("score",0),
-                    "session":bet.get("session",""),"amd_phase":bet.get("amd_phase","")}
-            poly_log_closed(closed)
-            poly_stats_update(bet_id,{"status":"CLOSED_REDEEM","close_data":closed})
+            poly_stats_update(bet_id,{"status":"CLOSED_REDEEM",
+                "profit":profit,"result":result,"bal_after":bal_after,
+                "closed_at":datetime.datetime.now(datetime.timezone.utc).isoformat()})
             await app.bot.send_message(chat_id=s.uid,text=(
                 "Маркет закрито  %s %s\n\n%s\n\n"
                 "Повернулось: $%.2f  Ставка: $%.2f\n"
@@ -514,14 +631,9 @@ async def check_open_bets(app, s):
             poly_result="WIN" if profit>0 else "LOSS"
             sign="+" if profit>=0 else "-"
             arrow="▲" if direction=="UP" else "▼"
-            closed={"bet_id":bet_id,"direction":direction,"mkt":mkt,"amount":amount,"size":ss,
-                    "entry_price":entry,"sell_price":sp,"cur_price":cur_price,"gross_return":gross,
-                    "profit":profit,"profit_pct":pct2,"result":poly_result,"close_reason":reason,
-                    "closed_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                    "strength":bet.get("strength",""),"score":bet.get("score",0),
-                    "session":bet.get("session",""),"amd_phase":bet.get("amd_phase","")}
-            poly_log_closed(closed)
-            poly_stats_update(bet_id,{"status":"CLOSED","close_data":closed})
+            poly_stats_update(bet_id,{"status":"CLOSED",
+                "sell_price":sp,"profit":profit,"result":poly_result,
+                "closed_at":datetime.datetime.now(datetime.timezone.utc).isoformat()})
             await app.bot.send_message(chat_id=s.uid,text=(
                 "Позицію закрито  %s %s\n\n%s\n\n"
                 "Причина: %s\nВхід: %.4f  Продаж: %.4f\n"
@@ -730,82 +842,59 @@ def stops(c,price):
     return sa,sb
 
 # ─────────────────────────────────────────────
-# BUILD PAYLOAD — заточений під 15хв вікно
-# Контекст: 1г для структури, 15хв для тактики, 1хв для входу
+# BUILD PAYLOAD
 # ─────────────────────────────────────────────
 def build_payload(s):
-    # Дані: 1г = контекст (4 свічки 15м), 15хв = тактика, 1хв = мікро
-    c15 = candles("15m", 20)   # 5 годин — структура і режим
-    c5  = candles("5m",  24)   # 2 години — тактика і sweeps
-    c1  = candles("1m",  20)   # 20 хвилин — мікро momentum
+    c15 = candles("15m", 20)
+    c5  = candles("5m",  24)
+    c1  = candles("1m",  20)
     if not c15: return None
 
     now      = time.time()
     px       = c15[-1]["c"]
 
-    # ── Momentum різних горизонтів ──────────────────────────────
-    # Зміна за поточну 15хв свічку (відносно її відкриття)
     chg_cur  = round((px - c15[-1]["o"]) / c15[-1]["o"] * 100, 4)
-    # Зміна за попередню 15хв свічку
     chg_prev = round((c15[-1]["o"] - c15[-2]["c"]) / c15[-2]["c"] * 100, 4) if len(c15)>=2 else 0.0
-    # Momentum 3 свічки 5м (15 хв назад)
     mom5     = round((c5[-1]["c"] - c5[-4]["c"]) / c5[-4]["c"] * 100, 4) if len(c5)>=4 else 0.0
-    # Мікро 3 свічки 1м (поточний рух)
     mic      = round((c1[-1]["c"] - c1[-4]["c"]) / c1[-4]["c"] * 100, 4) if len(c1)>=4 else 0.0
-    # Швидкість останньої 1хв свічки
     spd1     = round((c1[-1]["c"] - c1[-1]["o"]) / c1[-1]["o"] * 100, 4) if c1 else 0.0
 
-    # ── Структура ───────────────────────────────────────────────
     st15 = structure(c15) if len(c15)>=6 else "RANGING"
     st5  = structure(c5)  if len(c5)>=6  else "RANGING"
     st1  = structure(c1)  if len(c1)>=6  else "RANGING"
     reg  = mkt_regime(c15)
 
-    # ── Sweeps — тільки свіжі (ago<=2 на 5м, ago<=3 на 1м) ────
     sw5  = sweep(c5)  if len(c5)>=10  else {"type":"NONE","level":0.0,"ago":0}
     sw1  = sweep(c1)  if len(c1)>=10  else {"type":"NONE","level":0.0,"ago":0}
-    # 15м sweep для загального контексту
     sw15 = sweep(c15) if len(c15)>=10 else {"type":"NONE","level":0.0,"ago":0}
 
-    # ── BOS/CHoCH на 5м і 1м ────────────────────────────────────
     bc5 = bos(c5, st15) if len(c5)>=5 else None
     bc1 = bos(c1, st5)  if len(c1)>=5 else None
 
-    # ── FVG тільки на 5м (останні 12 свічок = 1 година) ────────
     f5a, f5b = fvg(c5[-12:], px) if len(c5)>=5 else (None, None)
 
-    # ── AMD і маніп ─────────────────────────────────────────────
     mn  = manip_detect(c5[-6:] if len(c5)>=6 else c1[-6:], sw5, px)
     ad  = detect_amd(c15, c5, px)
 
-    # ── Liquidity stops (найближчі) ─────────────────────────────
     sa, sb = stops(c5, px) if len(c5)>=6 else (None, None)
     da = round((sa["p"]-px)/px*100, 4) if sa else 999.0
     db = round((px-sb["p"])/px*100, 4) if sb else 999.0
 
-    # ── Order flow ──────────────────────────────────────────────
     fn = funding()
     lq = liqs()
     ob = orderbook()
     ls = lsr()
     oi, oic = oi_data()
 
-    # ── Волатильність ───────────────────────────────────────────
     vc, vs = vol_class(c15)
 
-    # ── Сесія ───────────────────────────────────────────────────
     sess_name, _ = session()
 
-    # ── Стан поточного вікна Polymarket ─────────────────────────
-    # Скільки секунд пройшло в поточному 15хв вікні
-    window_elapsed = now % 900          # 0..899
+    window_elapsed = now % 900
     window_left    = 900 - window_elapsed
-    # Де ціна відносно відкриття вікна (strike = ціна на початку вікна)
-    # Беремо ціну відкриття поточної 15хв свічки як апроксимацію strike
     strike_approx  = c15[-1]["o"]
     vs_strike      = round((px - strike_approx) / strike_approx * 100, 4)
 
-    # ── Consecutive same direction ───────────────────────────────
     consec_count, consec_dir = s.consecutive_same()
 
     return {
@@ -831,7 +920,7 @@ def build_payload(s):
     }
 
 # ─────────────────────────────────────────────
-# AI ПРОМПТ — логіка чистого 15хв трейдингу
+# AI ПРОМПТ — без змін
 # ─────────────────────────────────────────────
 SYS = """You are a BTC 15-minute scalp trader on Polymarket.
 Your ONLY job: will BTC price be HIGHER or LOWER in the next 15 minutes?
@@ -1121,7 +1210,7 @@ async def on_callback(u,c):
         except Exception as e: print("[Stats] csv: %s"%e)
 
     elif q.data=="poly_wr":
-        await q.message.reply_text(poly_winrate_msg())
+        await q.message.reply_text(poly_winrate_msg(s.uid))
 
     elif q.data=="analyze":
         await q.message.reply_text("Аналізую..."); await cycle(c.application,s)
@@ -1210,38 +1299,81 @@ async def on_message(u,c):
         except ValueError: pass
 
 # ─────────────────────────────────────────────
-# АВТО ТОРГІВЛЯ
+# АВТО ТОРГІВЛЯ — з інверсією і winrate логікою
 # ─────────────────────────────────────────────
 async def auto_trade(app, s, p, result):
-    dec=result.get("decision"); strength=result.get("strength","LOW"); logic=result.get("logic","")
+    dec      = result.get("decision")
+    strength = result.get("strength","LOW")
+    logic    = result.get("logic","")
+    score    = result.get("confidence_score", 0)
     if not dec: return
-    bal,err=get_balance(s)
+
+    # Знімаємо баланс ДО нової ставки — потрібен для resolve попередньої
+    bal, err = get_balance(s)
+
+    # Резолвимо попередню ставку через зміну балансу
+    if bal is not None:
+        resolved = poly_wr_resolve(s.uid, bal)
+        if resolved:
+            profit = resolved.get("profit", 0)
+            sign   = "+" if profit >= 0 else ""
+            await app.bot.send_message(chat_id=s.uid, text=(
+                "Результат попередньої ставки\n\n"
+                "Напрямок:     %s\n"
+                "Ставка:       $%.2f\n"
+                "Баланс до:    $%.2f\n"
+                "Баланс після: $%.2f\n"
+                "P&L:          %s$%.2f\n"
+                "Результат:    %s"
+            ) % (resolved.get("direction","?"),
+                 resolved.get("amount",0),
+                 resolved.get("bal_before",0),
+                 bal, sign, abs(profit),
+                 resolved.get("result","?")))
+
     if not bal or bal<=0:
         await app.bot.send_message(chat_id=s.uid,text="Баланс $0. Поповни на polymarket.com"); return
     amount=s.bet_size(bal)
     if amount<1:
         await app.bot.send_message(chat_id=s.uid,text="Ставка $%.2f < $1. Поповни баланс."%amount); return
-    bet=place_bet(s,dec,amount)
+
+    # Перевіряємо інверсію
+    ob_bias = p["pos"]["ob"]
+    amd_dir = p["amd"].get("dir","")
+    final_dec, inverted, invert_reason = maybe_invert(dec, ob_bias, amd_dir, score)
+
+    bet=place_bet(s, final_dec, amount)
     if bet["ok"]:
         bet_id="%d_%d"%(s.uid,int(time.time()))
         open_bet={
-            "bet_id":bet_id,"token_id":bet["token_id"],"direction":dec,
+            "bet_id":bet_id,"token_id":bet["token_id"],"direction":final_dec,
             "amount":amount,"size":bet["size"],"entry_price":bet["price"],
             "placed_at":time.time(),"market_end":bet.get("market_end",time.time()+900),
             "bal_before":bal,"mkt":bet.get("mkt",""),"strength":strength,"logic":logic,
-            "score":result.get("confidence_score",0),"key_signal":result.get("key_signal",""),
+            "score":score,"key_signal":result.get("key_signal",""),
             "amd_phase":p["amd"].get("phase",""),"session":p["ctx"]["sess"],
         }
         s.open_bets.append(open_bet)
         poly_stats_update(bet_id,{"status":"OPEN","open_data":open_bet,
             "opened_at":datetime.datetime.now(datetime.timezone.utc).isoformat()})
-        s.trades.append({"dec":dec,"amount":amount,"entry":p["price"]["cur"],
+
+        # Записуємо в winrate журнал
+        poly_wr_add(
+            uid=s.uid, bet_id=bet_id, direction=final_dec,
+            amount=amount, bal_before=bal, strength=strength,
+            session_name=p["ctx"]["sess"]
+        )
+
+        s.trades.append({"dec":final_dec,"amount":amount,"entry":p["price"]["cur"],
             "time":str(datetime.datetime.now(datetime.timezone.utc))})
+
+        # Повідомлення з нотаткою про інверсію якщо вона була
+        invert_note = "\nАI: %s → ІНВЕРТ: %s\nПричина: %s" % (dec, final_dec, invert_reason) if inverted else ""
         await app.bot.send_message(chat_id=s.uid,text=(
             "Ставка виконана  %s %s\n\n%s\n\n"
-            "Баланс: $%.2f  Ставка: $%.2f (13%%)\nПотенційно: +$%.2f\n\n%s"
-        )%("▲" if dec=="UP" else "▼",dec,bet.get("mkt","Polymarket"),
-           bal,amount,bet.get("pot",0),logic))
+            "Баланс: $%.2f  Ставка: $%.2f (13%%)\nПотенційно: +$%.2f\n\n%s%s"
+        )%("▲" if final_dec=="UP" else "▼", final_dec, bet.get("mkt","Polymarket"),
+           bal, amount, bet.get("pot",0), logic, invert_note))
     else:
         await app.bot.send_message(chat_id=s.uid,text="Ставка не виконана\n%s"%bet["err"])
 
@@ -1275,43 +1407,40 @@ async def cycle(app, s):
     f5a=p["liq"].get("f5a"); f5b=p["liq"].get("f5b")
     consec=p["ctx"]["consec_count"]
 
-    # Зберігаємо ВСІ дані для CSV
+    # Перевіряємо інверсію
+    ob_bias  = p["pos"]["ob"]
+    amd_dir  = ad.get("dir","")
+    final_dec, inverted, invert_reason = maybe_invert(dec, ob_bias, amd_dir, score)
+
+    # Зберігаємо сигнал (dec = оригінал AI, final_dec = що реально поставили)
     sig={
-        "dec":dec,"strength":strength,"confidence_score":score,"logic":logic,
+        "dec":final_dec,"strength":strength,"confidence_score":score,"logic":logic,
         "reasons":reasons,"key_signal":key_sig,"risk_note":risk_note,
         "entry":p["price"]["cur"],"time":p["ts"],"ts_unix":p["ts_unix"],"outcome":None,
         "session":p["ctx"]["sess"],"mkt_cond":mkt_cond,"regime":p["ctx"]["reg"],
-        # Window
         "window_elapsed":p["window"]["elapsed"],"window_left":p["window"]["left"],
         "strike":p["window"]["strike"],"vs_strike":p["window"]["vs_strike"],
-        # Momentum
         "chg_cur":p["price"]["chg_cur"],"chg_prev":p["price"]["chg_prev"],
         "mom5":p["price"]["mom5"],"mic":p["price"]["mic"],"spd1":p["price"]["spd1"],
-        # AMD
         "amd_phase":ad.get("phase","NONE"),"amd_dir":ad.get("dir",""),
         "amd_reason":ad.get("reason",""),"amd_conf":ad.get("conf",0),
-        # Sweeps
         "sw15_type":sw15.get("type","NONE"),"sw15_ago":sw15.get("ago",0),
         "sw5_type":sw5.get("type","NONE"),"sw5_level":sw5.get("level",0),"sw5_ago":sw5.get("ago",0),
         "sw1_type":sw1.get("type","NONE"),"sw1_ago":sw1.get("ago",0),
-        # BOS/FVG/Trap
         "bos5m":("%s_%s"%(bc5["type"],bc5["dir"])) if bc5 else "NONE",
         "bos1m":("%s_%s"%(bc1["type"],bc1["dir"])) if bc1 else "NONE",
         "fvg_up":("%.3f%%"%f5a["dist"]) if f5a else "",
         "fvg_dn":("%.3f%%"%f5b["dist"]) if f5b else "",
         "trap":mn["trap"],"trap_hint":str(mn["hint"]),
-        # Structure
         "st15m":p["struct"]["15m"],"st5m":p["struct"]["5m"],"st1m":p["struct"]["1m"],
-        # Vol
         "vol_class":p["ctx"]["vol"],"vol_avg":p["ctx"]["vs"],
-        # Order flow
         "fr":p["pos"]["fr"],"fs":p["pos"]["fs"],
         "ll":p["pos"]["ll"],"ls":p["pos"]["ls"],"lsig":p["pos"]["lsig"],
         "ob_bias":p["pos"]["ob"],"ob_imb":p["pos"]["obi"],
         "lsr_ratio":p["pos"]["lsrr"],"lsr_bias":p["pos"]["lsr"],"cl":p["pos"]["cl"],
         "oic":p["pos"]["oic"],
-        # Meta
         "consec":consec,
+        "inverted":inverted,"invert_reason":invert_reason,
     }
     s.signals.append(sig); s.save()
 
@@ -1324,23 +1453,29 @@ async def cycle(app, s):
     except: pass
 
     win     = p["window"]
-    arrow   = "▲" if dec=="UP" else "▼"
+    arrow   = "▲" if final_dec=="UP" else "▼"
     reas_s  = "\n".join("· "+r for r in reasons[:3]) if reasons else ""
     warn    = "\n⚠️ %d однакових підряд" % consec if consec >= 3 else ""
     win_info= "Вікно: %ds пройшло / %ds залишилось / vs_strike:%+.3f%%" % (
               win["elapsed"], win["left"], win["vs_strike"])
+
+    # Нотатка про інверсію в повідомленні
+    invert_note = ""
+    if inverted:
+        invert_note = "\n⚡ AI: %s → ІНВЕРТ: %s (%s)" % (dec, final_dec, invert_reason)
+
     main_txt = (
         "СИГНАЛ  %s %s  |  %s  |  Score:%+d\n\n"
-        "$%.2f  ·  %s  ·  %s%s\n"
+        "$%.2f  ·  %s  ·  %s%s%s\n"
         "%s\n\n"
         "%s\n\n%s\n\n%s\n\n"
         "Ризик: %s"
-    ) % (arrow, dec, strength, score,
-         p["price"]["cur"], mkt_cond, p["ctx"]["sess"], warn,
+    ) % (arrow, final_dec, strength, score,
+         p["price"]["cur"], mkt_cond, p["ctx"]["sess"], warn, invert_note,
          win_info, key_sig, logic, reas_s, risk_note)
 
-    print("[Cycle] uid=%d dec=%s str=%s score=%d consec=%d sess=%s"%(
-        s.uid,dec,strength,score,consec,p["ctx"]["sess"]))
+    print("[Cycle] uid=%d ai=%s final=%s inv=%s str=%s score=%d consec=%d sess=%s"%(
+        s.uid, dec, final_dec, inverted, strength, score, consec, p["ctx"]["sess"]))
 
     # Авто-Азія
     asia=is_asia()
@@ -1358,10 +1493,10 @@ async def cycle(app, s):
     if s.auto:
         await auto_trade(app, s, p, result)
     else:
-        s.pending={"dir":dec,"ts":time.time(),"price":p["price"]["cur"]}
+        s.pending={"dir":final_dec,"ts":time.time(),"price":p["price"]["cur"]}
         bal,_=get_balance(s); bet=s.bet_size(bal)
         ikb=InlineKeyboardMarkup([[
-            InlineKeyboardButton("Так",callback_data="confirm_%s"%dec),
+            InlineKeyboardButton("Так",callback_data="confirm_%s"%final_dec),
             InlineKeyboardButton("Ні", callback_data="skip")]])
         hint=(" (рекомендовано $%.2f = 13%%)"%bet) if bal else ""
         await app.bot.send_message(chat_id=s.uid,
