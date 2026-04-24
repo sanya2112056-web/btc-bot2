@@ -1381,8 +1381,6 @@ async def auto_trade(app, s, p, result):
 # ЦИКЛ
 # ─────────────────────────────────────────────
 async def cycle(app, s):
-    if s.ok and s.open_bets:
-        await check_open_bets(app, s)
     check_outcomes(s)
 
     p=build_payload(s)
@@ -1557,7 +1555,6 @@ def main():
 
     async def startup(app):
         asyncio.create_task(scheduler(app))
-        asyncio.create_task(position_watcher(app))
         asyncio.create_task(minute_tracker(app))
         log.info("BTC Bot v3 FINAL. Independent analysis. April 2026 macro context.")
 
