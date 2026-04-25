@@ -1107,6 +1107,7 @@ def kb(s):
          InlineKeyboardButton("Аналіз",     callback_data="analyze")],
         [InlineKeyboardButton("Маркет",     callback_data="market"),
          InlineKeyboardButton("Помилки",    callback_data="errors")],
+        [InlineKeyboardButton("Дані ринку", callback_data="rawdata")],
         [InlineKeyboardButton(asia,         callback_data="asia_info")],
     ])
 
@@ -1242,6 +1243,94 @@ async def on_callback(u,c):
                 lines.append("%d. %s %s\n   %s\n"%(i,e.get("dec","?"),e.get("strength","?"),e.get("key_signal","")[:60]))
             await q.message.reply_text("\n".join(lines)[:4000])
         except: await q.message.reply_text("Помилка читання файлу.")
+
+
+    elif q.data=="rawdata":
+        await q.message.reply_text("Збираю дані ринку...")
+        try:
+            p = build_payload(s)
+            if not p:
+                await q.message.reply_text("Помилка отримання даних Binance."); return
+            pr  = p["price"]; st = p["struct"]; ctx = p["ctx"]
+            liq = p["liq"];   pos = p["pos"];   ad  = p["amd"]
+            mn  = p["manip"]; win = p["window"]
+            sw5 = liq.get("sw5",{}); sw1 = liq.get("sw1",{}); sw15 = liq.get("sw15",{})
+            bc5 = liq.get("bos5"); bc1 = liq.get("bos1")
+            f5a = liq.get("f5a"); f5b = liq.get("f5b")
+            sa  = liq.get("sa"); sb = liq.get("sb")
+            lines = [
+                "ДАНІ РИНКУ  %s" % p["ts"],
+                "",
+                "ЦІНА",
+                "  Поточна:     $%.2f" % pr["cur"],
+                "  Mark price:  $%.2f" % pr["mark"],
+                "  Basis:       %+.2f" % pr["basis"],
+                "  Зміна свічки: %+.4f%%" % pr["chg_cur"],
+                "  Попередня:   %+.4f%%" % pr["chg_prev"],
+                "  Mom 5m:      %+.4f%%" % pr["mom5"],
+                "  Мікро 1m:   %+.4f%%" % pr["mic"],
+                "  Швидкість 1m: %+.4f%%" % pr["spd1"],
+                "",
+                "ВІКНО POLYMARKET",
+                "  Пройшло:    %ds" % win["elapsed"],
+                "  Залишилось: %ds" % win["left"],
+                "  Strike:     $%.2f" % win["strike"],
+                "  Vs strike:  %+.4f%%" % win["vs_strike"],
+                "",
+                "СТРУКТУРА",
+                "  15m: %s   5m: %s   1m: %s" % (st["15m"], st["5m"], st["1m"]),
+                "  Режим: %s" % ctx["reg"],
+                "  Волатильність: %s (%.4f)" % (ctx["vol"], ctx["vs"]),
+                "  Сесія: %s" % ctx["sess"],
+                "",
+                "SWEEPS (ліквідність)",
+                "  5m:  %s @ %.2f  ago=%d" % (sw5.get("type","NONE"), sw5.get("level",0), sw5.get("ago",0)),
+                "  1m:  %s @ %.2f  ago=%d" % (sw1.get("type","NONE"), sw1.get("level",0), sw1.get("ago",0)),
+                "  15m: %s  ago=%d" % (sw15.get("type","NONE"), sw15.get("ago",0)),
+                "",
+                "BOS / CHoCH",
+                "  5m: %s" % (("%s %s @ %.2f" % (bc5["type"], bc5["dir"], bc5["level"])) if bc5 else "немає"),
+                "  1m: %s" % (("%s %s @ %.2f" % (bc1["type"], bc1["dir"], bc1["level"])) if bc1 else "немає"),
+                "",
+                "FVG (Fair Value Gap)",
+                "  Вгору: %s" % (("dist=%.3f%%" % f5a["dist"]) if f5a else "немає"),
+                "  Вниз:  %s" % (("dist=%.3f%%" % f5b["dist"]) if f5b else "немає"),
+                "",
+                "STOPS (найближча ліквідність)",
+                "  Вище: %s" % (("$%.2f  (+%.3f%%)" % (sa["p"], liq.get("da",0))) if sa else "немає"),
+                "  Нижче: %s" % (("$%.2f  (-%.3f%%)" % (sb["p"], liq.get("db",0))) if sb else "немає"),
+                "",
+                "AMD (Accumulation-Manipulation-Distribution)",
+                "  Фаза:    %s" % ad.get("phase","NONE"),
+                "  Напрям:  %s" % (ad.get("dir","?") or "—"),
+                "  Conf:    %d" % ad.get("conf",0),
+                "  Причина: %s" % ad.get("reason",""),
+                "",
+                "МАНІПУЛЯЦІЯ / ПАСТКИ",
+                "  Trap:  %s" % mn["trap"],
+                "  Hint:  %s" % str(mn["hint"]),
+                "",
+                "ORDER FLOW",
+                "  Funding rate: %+.6f  (%s)" % (pos["fr"], pos["fs"]),
+                "  Order book:   %s  imb=%+.1f%%" % (pos["ob"], pos["obi"]),
+                "  L/S ratio:    %.3f  (%s)" % (pos["lsrr"], pos["lsr"]),
+                "  Crowd long:   %.1f%%" % pos["cl"],
+                "  OI change:    %+.4f%%" % pos["oic"],
+                "",
+                "ЛІКВІДАЦІЇ (останні 15хв)",
+                "  Long cascade: $%.0f" % pos["ll"],
+                "  Short squeeze: $%.0f" % pos["ls"],
+                "  Сигнал:       %s" % pos["lsig"],
+                "  Exhausted:    %s" % str(pos["exh"]),
+                "",
+                "CONSECUTIVE SAME: %d (%s)" % (ctx["consec_count"], ctx["consec_dir"]),
+            ]
+            text = "\n".join(lines)
+            # Telegram ліміт 4096 символів — ріжемо якщо треба
+            for i in range(0, len(text), 4000):
+                await q.message.reply_text(text[i:i+4000])
+        except Exception as e:
+            await q.message.reply_text("Помилка збору даних: %s" % str(e)[:200])
 
     elif q.data=="skip":
         s.pending={}; await q.edit_message_text("Скасовано.")
