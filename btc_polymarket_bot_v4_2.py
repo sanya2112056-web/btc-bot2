@@ -4,12 +4,12 @@ Railway Variables: TELEGRAM_BOT_TOKEN + OPENAI_API_KEY
 Magic.Link | signature_type=1 | auto-trade every 15min
 """
 import asyncio, logging, json, time, datetime, os, re, io, csv, requests
-from openai import OpenAI
+import anthropic
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
+OPENAI_API_KEY     = os.getenv("ANTHROPIC_API_KEY", "")
 OI_CACHE   = "oi_cache.json"
 DUMP_FILE  = "signals_dump.json"
 POLY_STATS = "poly_stats.json"
@@ -979,7 +979,7 @@ OUTPUT JSON only — no markdown, nothing outside JSON:
 
 def analyze_with_ai(p, s):
     try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
+        client = anthropic.Anthropic(api_key=OPENAI_API_KEY)
         liq = p["liq"]; pos = p["pos"]; pr = p["price"]
         st  = p["struct"]; ctx = p["ctx"]; mn = p["manip"]; ad = p["amd"]
         sw5 = liq.get("sw5",{}); sw1 = liq.get("sw1",{}); sw15 = liq.get("sw15",{})
@@ -1027,12 +1027,12 @@ def analyze_with_ai(p, s):
             ctx["consec_count"], ctx["consec_dir"]
         )
 
-        resp = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role":"system","content":SYS},{"role":"user","content":msg}],
-            temperature=0.1,
-            response_format={"type":"json_object"})
-        return json.loads(resp.choices[0].message.content)
+        resp = client.messages.create(
+            model="claude-sonnet-4-5-20251001",
+            max_tokens=1024,
+            system=SYS,
+            messages=[{"role":"user","content":msg}])
+        return json.loads(resp.content[0].text)
     except Exception as e:
         log.error("AI: %s", e); return None
 
