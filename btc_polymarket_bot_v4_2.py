@@ -1032,7 +1032,12 @@ def analyze_with_ai(p, s):
             max_tokens=1024,
             system=SYS,
             messages=[{"role":"user","content":msg}])
-        return json.loads(resp.content[0].text)
+        raw = resp.content[0].text.strip()
+        # Прибираємо markdown якщо Claude загорнув у ```json
+        if raw.startswith("```"):
+            raw = raw.split("```")[-2] if "```" in raw else raw
+            raw = raw.lstrip("json").strip()
+        return json.loads(raw)
     except Exception as e:
         log.error("AI: %s", e); return None
 
