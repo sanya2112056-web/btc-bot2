@@ -313,363 +313,6 @@ def maybe_invert(dec, ob_bias, amd_dir, score):
     return new_dec, True, reason_str
 
 # ─────────────────────────────────────────────
-# DECIDE_TRADE — decision layer для агента
-# ─────────────────────────────────────────────
-def decide_trade(base_signal, ob_bias, consecutive_same, balance):
-    """
-    Пріоритетна логіка напрямку і ставки.
-    Повертає (direction, stake, reason).
-    """
-    # ── Напрямок (пріоритет зверху вниз) ──
-    if consecutive_same >= 3:
-        direction = "DOWN" if base_signal == "UP" else "UP"
-        reason = "SERIES_REVERSAL"
-    elif ob_bias == "BID_HEAVY":
-        direction = "UP"
-        reason = "BID_HEAVY_OVERRIDE"
-    elif ob_bias == "ASK_HEAVY":
-        direction = base_signal
-        reason = "ASK_CONFIRM"
-    else:  # BALANCED
-        if consecutive_same == 2:
-            direction = "DOWN" if base_signal == "UP" else "UP"
-            reason = "BALANCED_REVERSAL"
-        else:
-            direction = base_signal
-            reason = "BALANCED_DEFAULT"
-
-    # ── Відсоток ставки ──
-    if consecutive_same >= 3:
-        pct = 0.07
-    elif ob_bias == "BID_HEAVY" and consecutive_same < 2:
-        pct = 0.15
-    elif ob_bias == "BID_HEAVY":
-        pct = 0.12
-    elif ob_bias == "ASK_HEAVY":
-        pct = 0.08
-    else:  # BALANCED
-        pct = 0.06
-
-    stake = round(max(1.0, min(balance * pct, 500.0)), 2)
-    print("[decide_trade] %s $%.2f %s" % (direction, stake, reason))
-    return direction, stake, reason
-
-# ─────────────────────────────────────────────
-# AI АГЕНТ
-# ─────────────────────────────────────────────
-AGENT_SYS = """You are an AI trading agent for a BTC Polymarket 15-minute prediction bot.
-Respond ONLY with valid JSON (no markdown, no extra text outside JSON):
-{"message": "explanation in Ukrainian", "action": "ACTION", "params": {}}
-
-ACTIONS:
-- "analyze"        — analyze current BTC market
-- "trade"          — execute trade now using decide_trade logic
-- "monitor"        — set up conditional monitoring
-- "find_anomalies" — find anomalies in current market data
-- "stop_monitor"   — stop active monitoring
-- "info"           — respond with message only, no action
-
-MONITOR PARAMS (for "monitor" action):
-{"condition_type": "win_streak" or "session",
- "required_wins": N,
- "sessions": ["LONDON","NY_OPEN","ASIA","NY_PM"],
- "direction": "auto"}
-
-INTERPRETATION GUIDE:
-"поторгуй в лондон" → monitor, condition_type=session, sessions=["LONDON"]
-"якщо 3 сигнали плюсові" → monitor, condition_type=win_streak, required_wins=3
-"торгуй зараз" → trade
-"проаналізуй ринок" → analyze
-"знайди аномалії" → find_anomalies
-"зупинись / стоп" → stop_monitor
-
-Always write message in Ukrainian. Be concise."""
-
-
-def agent_init(s):
-    """Лінива ініціалізація атрибутів агента на сесії."""
-    if not hasattr(s, "agent_active"):    s.agent_active    = False
-    if not hasattr(s, "agent_history"):   s.agent_history   = []
-    if not hasattr(s, "agent_condition"): s.agent_condition = None
-    if not hasattr(s, "agent_wins"):      s.agent_wins      = 0
-
-
-async def agent_analyze(s):
-    """Збирає ринкові дані і повертає (payload, текст аналізу)."""
-    p = build_payload(s)
-    if not p:
-        return None, "Помилка отримання даних ринку."
-    pr  = p["price"]; st = p["struct"]; ctx = p["ctx"]
-    pos = p["pos"];   ad = p["amd"];    mn  = p["manip"]
-    sw5  = p["liq"].get("sw5",{});  sw15 = p["liq"].get("sw15",{})
-    bc5  = p["liq"].get("bos5");    f5a  = p["liq"].get("f5a"); f5b = p["liq"].get("f5b")
-    lines = [
-        "АНАЛІЗ РИНКУ  %s" % p["ts"], "",
-        "Ціна: $%.2f | Зміна: %+.4f%%" % (pr["cur"], pr["chg_cur"]),
-        "Мікро 1м: %+.4f%% | Момент 5м: %+.4f%%" % (pr["mic"], pr["mom5"]),
-        "Funding: %+.6f (%s)" % (pos["fr"], pos["fs"]), "",
-        "Структура: 15м=%s  5м=%s  1м=%s" % (st["15m"], st["5m"], st["1m"]),
-        "Режим: %s | Волатильність: %s (%.4f)" % (ctx["reg"], ctx["vol"], ctx["vs"]),
-        "Сесія: %s" % ctx["sess"], "",
-        "AMD: %s → %s conf=%d | %s" % (
-            ad.get("phase","NONE"), ad.get("dir","?"), ad.get("conf",0), ad.get("reason","")),
-        "Sweep 5м: %s@%.2f ago=%d | Sweep 15м: %s ago=%d" % (
-            sw5.get("type","NONE"), sw5.get("level",0), sw5.get("ago",0),
-            sw15.get("type","NONE"), sw15.get("ago",0)),
-        "BOS 5м: %s" % (("%s %s@%.2f"%(bc5["type"],bc5["dir"],bc5["level"])) if bc5 else "немає"),
-        "FVG вгору: %s | вниз: %s" % (
-            ("%.3f%%"%f5a["dist"]) if f5a else "немає",
-            ("%.3f%%"%f5b["dist"]) if f5b else "немає"),
-        "Trap: %s hint=%s" % (mn["trap"], str(mn["hint"])), "",
-        "OB: %s (%+.1f%%) | L/S: %.3f (%s)" % (pos["ob"], pos["obi"], pos["lsrr"], pos["lsr"]),
-        "Crowd Long: %.1f%% | OI: %+.4f%%" % (pos["cl"], pos["oic"]),
-        "Ліквідації: Long=$%.0f  Short=$%.0f  (%s)" % (pos["ll"], pos["ls"], pos["lsig"]),
-    ]
-    return p, "\n".join(lines)
-
-
-async def agent_find_anomalies(s):
-    """Пошук аномалій у поточних ринкових даних."""
-    p = build_payload(s)
-    if not p:
-        return "Помилка отримання даних."
-    pos  = p["pos"]; pr = p["price"]; ad = p["amd"]
-    mn   = p["manip"]; ctx = p["ctx"]
-    sw5  = p["liq"].get("sw5",{}); sw15 = p["liq"].get("sw15",{})
-    bc5  = p["liq"].get("bos5")
-    anomalies = []; score = 0
-
-    if abs(pos["obi"]) > 30:
-        anomalies.append("OB дисбаланс: %+.1f%% (%s)" % (pos["obi"], pos["ob"]))
-        score += 2
-    if ad.get("phase") == "MANIPULATION_DONE" and ad.get("conf",0) >= 2:
-        anomalies.append("AMD MANIPULATION_DONE conf=%d dir=%s" % (ad.get("conf",0), ad.get("dir","?")))
-        score += 3
-    for sw, tf in [(sw5,"5м"), (sw15,"15м")]:
-        if sw.get("type","NONE") != "NONE" and sw.get("ago",99) <= 2:
-            anomalies.append("Свіжий sweep %s на %s ago=%d @ %.2f" % (
-                sw.get("type"), tf, sw.get("ago"), sw.get("level",0)))
-            score += 2
-    total_liq = pos["ll"] + pos["ls"]
-    if total_liq > 2_000_000:
-        anomalies.append("Великі ліквідації: $%.0f (%s)" % (total_liq, pos["lsig"]))
-        score += 2
-    if mn["trap"] != "NONE":
-        anomalies.append("Ловушка: %s hint=%s" % (mn["trap"], str(mn["hint"])))
-        score += 2
-    if bc5:
-        anomalies.append("BOS/CHoCH 5м: %s %s @ %.2f" % (bc5["type"], bc5["dir"], bc5["level"]))
-        score += 2
-    if abs(pos["fr"]) > 0.001:
-        anomalies.append("Екстремальний funding: %+.6f (%s)" % (pos["fr"], pos["fs"]))
-        score += 1
-    if pos["cl"] > 75 or pos["cl"] < 25:
-        anomalies.append("Crowd: %.1f%% LONG (%s)" % (pos["cl"], pos["lsr"]))
-        score += 1
-
-    if not anomalies:
-        return ("Аномалії не знайдено\n\nЦіна: $%.2f\nРежим: %s\nOB: %s\n"
-                "Рекомендація: Чекати чіткого сигналу" % (pr["cur"], ctx["reg"], pos["ob"]))
-
-    label = ("ВИСОКА МОЖЛИВІСТЬ" if score >= 5 else
-             "СЕРЕДНЯ МОЖЛИВІСТЬ" if score >= 3 else "СЛАБКИЙ СИГНАЛ")
-    lines = ["АНОМАЛІЇ POLYMARKET  score=%d\n" % score]
-    lines += ["- " + a for a in anomalies]
-    lines += ["", "Ціна: $%.2f | Сесія: %s" % (pr["cur"], ctx["sess"]), "", label]
-    return "\n".join(lines)
-
-
-async def agent_process_message(s, user_message):
-    """Відправляємо повідомлення Claude і отримуємо JSON-відповідь."""
-    agent_init(s)
-    bal, _ = get_balance(s) if s.ok else (None, None)
-    recent_str = ""
-    for sig in s.signals[-5:]:
-        recent_str += "\n- %s %s score=%d %s" % (
-            sig.get("dec","?"), sig.get("strength","?"),
-            sig.get("confidence_score",0), sig.get("outcome","PENDING"))
-    cond_str = ""
-    if s.agent_condition:
-        cond_str = "\nАктивний моніторинг: type=%s wins=%d/%d" % (
-            s.agent_condition.get("type",""), s.agent_wins,
-            s.agent_condition.get("required_wins",0))
-    context_msg = (
-        "Стан бота:\nБаланс: %s | Гаманець: %s | Сесія: %s%s\nОстанні сигнали: %s"
-    ) % (
-        ("$%.2f" % bal) if bal else "невідомо",
-        "підключено" if s.ok else "ні",
-        session()[0], cond_str,
-        recent_str or " немає"
-    )
-    s.agent_history.append({"role": "user", "content": user_message})
-    s.agent_history = s.agent_history[-20:]
-    try:
-        client  = anthropic.Anthropic(api_key=OPENAI_API_KEY)
-        messages = [{"role": "user", "content": context_msg}] + s.agent_history
-        resp     = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=512,
-            system=AGENT_SYS,
-            messages=messages
-        )
-        raw = resp.content[0].text.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1] if len(raw.split("```")) > 1 else raw
-            raw = raw.lstrip("json").strip()
-        result = json.loads(raw)
-        s.agent_history.append({"role": "assistant", "content": raw})
-        return result
-    except Exception as e:
-        log.error("[Agent] %s", e)
-        return {"message": "Помилка агента: %s" % str(e)[:80], "action": "info", "params": {}}
-
-
-async def agent_execute(app, s, result):
-    """Виконуємо дію, яку повернув агент."""
-    agent_init(s)
-    action  = result.get("action", "info")
-    params  = result.get("params", {})
-    message = result.get("message", "")
-
-    if action == "analyze":
-        p, text = await agent_analyze(s)
-        if p:
-            ai_r    = analyze_with_ai(p, s)
-            ai_note = ""
-            if ai_r:
-                ai_note = "\n\nAI: %s (%s) score=%d\n%s" % (
-                    ai_r.get("decision","?"), ai_r.get("strength","?"),
-                    ai_r.get("confidence_score",0), ai_r.get("logic",""))
-            full = (message + "\n\n" + text + ai_note).strip()
-            for i in range(0, len(full), 4000):
-                await app.bot.send_message(chat_id=s.uid, text=full[i:i+4000])
-        else:
-            await app.bot.send_message(chat_id=s.uid, text=message or "Помилка аналізу.")
-
-    elif action == "trade":
-        if not s.ok:
-            await app.bot.send_message(chat_id=s.uid, text="Гаманець не підключено."); return
-        await app.bot.send_message(chat_id=s.uid, text=message or "Збираю дані...")
-        p = build_payload(s)
-        if not p:
-            await app.bot.send_message(chat_id=s.uid, text="Помилка даних ринку."); return
-        ai_r = analyze_with_ai(p, s)
-        if not ai_r:
-            await app.bot.send_message(chat_id=s.uid, text="Помилка AI."); return
-        bal, _ = get_balance(s)
-        if not bal or bal <= 0:
-            await app.bot.send_message(chat_id=s.uid, text="Баланс $0. Поповни на polymarket.com"); return
-        base_sig  = ai_r.get("decision","UP")
-        ob_bias   = p["pos"]["ob"]
-        consec    = p["ctx"]["consec_count"]
-        direction, stake, reason = decide_trade(base_sig, ob_bias, consec, bal)
-        await app.bot.send_message(chat_id=s.uid, text=(
-            "Агент ставить:\nНапрямок: %s  Сума: $%.2f  Причина: %s\n"
-            "AI сигнал: %s (%s) score=%d"
-        ) % (direction, stake, reason, base_sig,
-             ai_r.get("strength","?"), ai_r.get("confidence_score",0)))
-        bet = place_bet(s, direction, stake)
-        if bet["ok"]:
-            await app.bot.send_message(chat_id=s.uid, text=(
-                "✅ Ставку виконано!\n%s | $%.2f | Потенціал: +$%.2f"
-            ) % (direction, stake, bet.get("pot",0)))
-        else:
-            await app.bot.send_message(chat_id=s.uid, text="❌ Ставка не вдалась\n%s" % bet["err"])
-
-    elif action == "monitor":
-        s.agent_condition = {
-            "type":          params.get("condition_type","win_streak"),
-            "required_wins": params.get("required_wins", 3),
-            "sessions":      params.get("sessions", []),
-            "direction":     params.get("direction", "auto"),
-            "created_at":    time.time(),
-        }
-        s.agent_wins = 0
-        sessions_str = ", ".join(s.agent_condition["sessions"]) or "будь-яка"
-        await app.bot.send_message(chat_id=s.uid, text=(
-            "🔍 Моніторинг активовано\n\n%s\n\n"
-            "Тип: %s\nПотрібно перемог: %d\nСесії: %s"
-        ) % (message, s.agent_condition["type"],
-             s.agent_condition["required_wins"], sessions_str))
-
-    elif action == "find_anomalies":
-        await app.bot.send_message(chat_id=s.uid, text=message or "Шукаю аномалії...")
-        text = await agent_find_anomalies(s)
-        for i in range(0, len(text), 4000):
-            await app.bot.send_message(chat_id=s.uid, text=text[i:i+4000])
-
-    elif action == "stop_monitor":
-        s.agent_condition = None; s.agent_wins = 0
-        await app.bot.send_message(chat_id=s.uid, text=message or "Моніторинг зупинено.")
-
-    else:
-        if message:
-            await app.bot.send_message(chat_id=s.uid, text=message)
-
-
-async def agent_check_condition(app, s, p, ai_result):
-    """Перевіряємо умови агента після кожного циклу."""
-    agent_init(s)
-    if not s.agent_active or not s.agent_condition: return
-    cond      = s.agent_condition
-    cond_type = cond.get("type","")
-    req_wins  = cond.get("required_wins", 3)
-    sessions  = cond.get("sessions", [])
-    cur_sess  = p["ctx"]["sess"]
-
-    if sessions and cur_sess not in sessions:
-        return  # не наша сесія
-
-    dec      = ai_result.get("decision","UP")
-    score    = ai_result.get("confidence_score",0)
-    strength = ai_result.get("strength","LOW")
-
-    if cond_type == "win_streak":
-        if score > 0:
-            s.agent_wins += 1
-            await app.bot.send_message(chat_id=s.uid, text=(
-                "🔍 Агент: сигнал %d/%d  %s %s score=%d"
-            ) % (s.agent_wins, req_wins, dec, strength, score))
-            if s.agent_wins >= req_wins:
-                await app.bot.send_message(chat_id=s.uid, text=(
-                    "✅ Умова виконана! %d/%d  Торгую..."
-                ) % (s.agent_wins, req_wins))
-                bal, _ = get_balance(s)
-                if bal and bal > 0:
-                    ob_bias   = p["pos"]["ob"]
-                    consec    = p["ctx"]["consec_count"]
-                    direction, stake, reason = decide_trade(dec, ob_bias, consec, bal)
-                    bet = place_bet(s, direction, stake)
-                    if bet["ok"]:
-                        await app.bot.send_message(chat_id=s.uid, text=(
-                            "🤖 Агент поставив: %s $%.2f (%s)"
-                        ) % (direction, stake, reason))
-                    else:
-                        await app.bot.send_message(chat_id=s.uid, text="❌ %s" % bet["err"])
-                s.agent_wins = 0  # скидаємо після ставки
-
-    elif cond_type == "session":
-        bal, _ = get_balance(s)
-        if bal and bal > 0:
-            ob_bias   = p["pos"]["ob"]
-            consec    = p["ctx"]["consec_count"]
-            direction, stake, reason = decide_trade(dec, ob_bias, consec, bal)
-            await app.bot.send_message(chat_id=s.uid, text=(
-                "🤖 Агент (сесія %s): %s $%.2f (%s)"
-            ) % (cur_sess, direction, stake, reason))
-            bet = place_bet(s, direction, stake)
-            if not bet["ok"]:
-                await app.bot.send_message(chat_id=s.uid, text="❌ %s" % bet["err"])
-
-
-async def agent_handle_message(app, s, txt):
-    """Точка входу — обробляємо текст від юзера через агента."""
-    agent_init(s)
-    await app.bot.send_message(chat_id=s.uid, text="🤖 Агент думає...")
-    result = await agent_process_message(s, txt)
-    await agent_execute(app, s, result)
-
-# ─────────────────────────────────────────────
 # POLY STATS (для сумісності зі старими даними)
 # ─────────────────────────────────────────────
 def poly_stats_update(bet_id, update):
@@ -1466,8 +1109,6 @@ def kb(s):
          InlineKeyboardButton("Помилки",    callback_data="errors")],
         [InlineKeyboardButton("Дані ринку", callback_data="rawdata")],
         [InlineKeyboardButton(asia,         callback_data="asia_info")],
-        [InlineKeyboardButton("⏹ Стоп Агент" if getattr(s,"agent_active",False) else "🤖 AI Агент",
-                              callback_data="agent_toggle")],
     ])
 
 WELCOME=(
@@ -1691,29 +1332,6 @@ async def on_callback(u,c):
         except Exception as e:
             await q.message.reply_text("Помилка збору даних: %s" % str(e)[:200])
 
-    elif q.data=="agent_toggle":
-        agent_init(s)
-        s.agent_active = not s.agent_active
-        if s.agent_active:
-            s.agent_history   = []
-            s.agent_condition = None
-            s.agent_wins      = 0
-            await q.message.reply_text(
-                "🤖 AI Агент активовано!\n\n"
-                "Напишіть будь-яку команду:\n"
-                "· Поторгуй в Лондон\n"
-                "· Якщо 3 сигнали позитивні — торгуй\n"
-                "· Проаналізуй ринок\n"
-                "· Знайди аномалії\n"
-                "· Торгуй зараз\n"
-                "· Зупинись\n\n"
-                "Для зупинки натисни кнопку '⏹ Стоп Агент'",
-                reply_markup=kb(s))
-        else:
-            s.agent_condition = None
-            s.agent_history   = []
-            await q.message.reply_text("⏹ AI Агент зупинено.", reply_markup=kb(s))
-
     elif q.data=="skip":
         s.pending={}; await q.edit_message_text("Скасовано.")
 
@@ -1735,12 +1353,6 @@ async def on_callback(u,c):
 # ─────────────────────────────────────────────
 async def on_message(u,c):
     s=sess(u.effective_user.id); txt=u.message.text.strip()
-
-    # ── Агент перехоплює повідомлення коли активний ──
-    agent_init(s)
-    if s.agent_active and s.state is None and not s.pending:
-        await agent_handle_message(c.application, s, txt)
-        return
 
     if s.state=="key":
         clean=txt.lower().replace("0x","").replace(" ","")
@@ -1815,15 +1427,14 @@ async def auto_trade(app, s, p, result):
 
     if not bal or bal<=0:
         await app.bot.send_message(chat_id=s.uid,text="Баланс $0. Поповни на polymarket.com"); return
-
-    # decide_trade визначає напрямок і розмір ставки
-    ob_bias        = p["pos"]["ob"]
-    consec         = p["ctx"]["consec_count"]
-    final_dec, amount, dt_reason = decide_trade(dec, ob_bias, consec, bal)
-    inverted       = (final_dec != dec)
-    invert_reason  = dt_reason if inverted else ""
-    if amount < 1:
+    amount=s.bet_size(bal)
+    if amount<1:
         await app.bot.send_message(chat_id=s.uid,text="Ставка $%.2f < $1. Поповни баланс."%amount); return
+
+    # Перевіряємо інверсію
+    ob_bias = p["pos"]["ob"]
+    amd_dir = p["amd"].get("dir","")
+    final_dec, inverted, invert_reason = maybe_invert(dec, ob_bias, amd_dir, score)
 
     bet=place_bet(s, final_dec, amount)
     if bet["ok"]:
@@ -1982,12 +1593,6 @@ async def cycle(app, s):
         hint=(" (рекомендовано $%.2f = 13%%)"%bet) if bal else ""
         await app.bot.send_message(chat_id=s.uid,
             text=main_txt+"\n\nВведи суму USDC"+hint+":",reply_markup=ikb)
-
-    # ── Перевірка умов агента після кожного циклу ──
-    agent_init(s)
-    if s.agent_active and s.agent_condition:
-        try: await agent_check_condition(app, s, p, result)
-        except Exception as _e: log.error("[Agent] uid=%d: %s", s.uid, _e)
 
 # ─────────────────────────────────────────────
 # ПЛАНУВАЛЬНИК
