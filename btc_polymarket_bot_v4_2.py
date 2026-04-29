@@ -900,7 +900,9 @@ def build_payload(s):
 
     sess_name, _ = session()
 
-    window_elapsed = now % 900
+    # FIX: window_elapsed через реальні хвилини UTC, не unix % 900
+    now_dt         = datetime.datetime.now(datetime.timezone.utc)
+    window_elapsed = (now_dt.minute % 15) * 60 + now_dt.second
     window_left    = 900 - window_elapsed
     strike_approx  = c15[-1]["o"]
     vs_strike      = round((px - strike_approx) / strike_approx * 100, 4)
@@ -979,6 +981,9 @@ score <= 0 → LOW (weak/no setup — still give answer)
 3. consecutive_same >= 3 → need score >= 4 for same direction, else give opposite.
 4. CHOPPY → always LOW strength.
 5. Need at least 2 confirming signals for MEDIUM. At least 3 for HIGH.
+6. HIGH strength only if score >= 6 AND at least 3 independent confirming signals. Be conservative.
+7. Negative basis (Mark < Spot) = bearish futures pressure. Factor into direction.
+8. DEAD session (03:00-07:00 UTC): reduce strength by 1 level, avoid HIGH entirely.
 
 OUTPUT JSON only — no markdown, nothing outside JSON:
 {"decision":"UP or DOWN","strength":"HIGH or MEDIUM or LOW",
@@ -1011,6 +1016,7 @@ def analyze_with_ai(p, s):
             "FVGup:%s FVGdn:%s StopsAbove:%.3f%% StopsBelow:%.3f%%\n"
             "AMD:%s->%s conf=%d [%s] Trap:%s hint=%s\n"
             "\n=== ORDER FLOW ===\n"
+            "Mark:$%.2f Basis:%+.2f\n"
             "Funding:%+.6f(%s) Book:%s(%+.1f%%) L/S:%.3f(%s) CrowdLong:%.1f%%\n"
             "LiqLong:$%.0f LiqShort:$%.0f LiqSig:%s Exhausted:%s OI_chg:%+.4f%%\n"
             "\n=== META ===\n"
@@ -1031,6 +1037,7 @@ def analyze_with_ai(p, s):
             liq.get("da",999), liq.get("db",999),
             ad.get("phase","NONE"), ad.get("dir","?"), ad.get("conf",0), ad.get("reason",""),
             mn["trap"], str(mn["hint"]),
+            pr["mark"], pr["basis"],
             pos["fr"], pos["fs"], pos["ob"], pos["obi"],
             pos["lsrr"], pos["lsr"], pos["cl"],
             pos["ll"], pos["ls"], pos["lsig"], str(pos["exh"]), pos["oic"],
@@ -1038,7 +1045,7 @@ def analyze_with_ai(p, s):
         )
 
         resp = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model="claude-sonnet-4-5-20251001",
             max_tokens=1024,
             system=SYS,
             messages=[{"role":"user","content":msg}])
@@ -1774,7 +1781,7 @@ async def agent_process(uid, s, app, user_msg):
     try:
         client = anthropic.Anthropic(api_key=OPENAI_API_KEY)
         resp = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model="claude-sonnet-4-5-20251001",
             max_tokens=2048,
             system=AGENT_SYS,
             messages=agent["history"]
@@ -1803,7 +1810,7 @@ async def agent_process(uid, s, app, user_msg):
             # Якщо були tool results — даємо агенту відповісти ще раз
             agent["history"].append({"role": "user", "content": "Tool results:\n" + "\n".join(tool_results)})
             resp2 = client.messages.create(
-                model="claude-haiku-4-5-20251001",
+                model="claude-sonnet-4-5-20251001",
                 max_tokens=1024,
                 system=AGENT_SYS,
                 messages=agent["history"]
