@@ -64,7 +64,7 @@ class Session:
 
     def bet_size(self, bal):
         if not bal or bal <= 0: return 0.0
-        return round(max(1.0, min(bal * 0.13, 500.0)), 2)
+        return round(max(1.0, min(bal * 0.10, 500.0)), 2)
 
     def reset_client(self):
         self._client = None
@@ -89,15 +89,20 @@ def sess(uid):
 # ─────────────────────────────────────────────
 def get_client(s):
     if s._client is not None: return s._client
-    from py_clob_client.client import ClobClient
-    from py_clob_client.constants import POLYGON
-    client = ClobClient(host="https://clob.polymarket.com", key=s.key,
-                        chain_id=POLYGON, signature_type=1, funder=s.funder)
-    creds = client.create_or_derive_api_creds()
-    client.set_api_creds(creds)
+    from py_clob_client_v2 import ClobClient
+    HOST = "https://clob.polymarket.com"
+    # L1: отримуємо API creds
+    tmp = ClobClient(host=HOST, chain_id=137, key=s.key,
+                     signature_type=1, funder=s.funder)
+    creds = tmp.create_or_derive_api_key()
+    # L2: повноцінний клієнт
+    client = ClobClient(host=HOST, chain_id=137, key=s.key,
+                        creds=creds, signature_type=1, funder=s.funder)
     s._client = client
-    ak = getattr(creds,"api_key",None) or (creds.get("apiKey","") if isinstance(creds,dict) else "")
-    print("[Client] OK key=%s..." % str(ak)[:12])
+    try:
+        ak = creds.api_key if hasattr(creds, "api_key") else str(creds)[:12]
+        print("[Client v2] OK key=%s..." % str(ak)[:12])
+    except: print("[Client v2] OK")
     return client
 
 # ─────────────────────────────────────────────
@@ -106,7 +111,7 @@ def get_client(s):
 def get_balance(s):
     if not s.ok or not s.key: return None, "Гаманець не підключено"
     try:
-        from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+        from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
         client = get_client(s)
         params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         resp   = client.get_balance_allowance(params=params)
@@ -120,7 +125,7 @@ def get_balance(s):
 
 def get_token_balance(s, token_id):
     try:
-        from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+        from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
         params = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
         resp   = get_client(s).get_balance_allowance(params=params)
         raw    = float(resp.get("balance") or 0) if isinstance(resp,dict) else float(getattr(resp,"balance",0) or 0)
@@ -522,16 +527,18 @@ def place_bet(s, direction, amount):
     last_err=""
     for attempt in range(1,4):
         try:
-            from py_clob_client.clob_types import OrderArgs, OrderType
-            from py_clob_client.order_builder.constants import BUY
+            from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions, Side
             client=get_client(s)
-            order =client.create_order(OrderArgs(token_id=token_id,price=price,size=size,side=BUY))
-            resp  =client.post_order(order,OrderType.GTC)
+            resp = client.create_and_post_order(
+                order_args=OrderArgs(token_id=token_id, price=price, size=size, side=Side.BUY),
+                options=PartialCreateOrderOptions(tick_size="0.01"),
+                order_type=OrderType.GTC,
+            )
             return {"ok":True,"resp":resp,"price":price,"pot":round(size-amount,2),
                     "mkt":mkt["q"][:60],"token_id":token_id,"size":size,"market_end":market_end}
         except Exception as e:
             last_err=str(e)
-            if "500" in last_err or "execution" in last_err.lower():
+            if "version_mismatch" in last_err.lower() or "500" in last_err or "execution" in last_err.lower():
                 s.reset_client()
                 if attempt<3: time.sleep(3); continue
             if any(x in last_err.lower() for x in ["unauthorized","401","forbidden","invalid api key"]):
@@ -556,10 +563,13 @@ def force_sell(s, token_id, size, mode="normal"):
     last_err=""
     for attempt in range(1,4):
         try:
-            from py_clob_client.clob_types import OrderArgs, OrderType
-            from py_clob_client.order_builder.constants import SELL
-            order=get_client(s).create_order(OrderArgs(token_id=token_id,price=sell_price,size=sell_size,side=SELL))
-            resp =get_client(s).post_order(order,OrderType.GTC)
+            from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions, Side
+            client = get_client(s)
+            resp = client.create_and_post_order(
+                order_args=OrderArgs(token_id=token_id, price=sell_price, size=sell_size, side=Side.SELL),
+                options=PartialCreateOrderOptions(tick_size="0.01"),
+                order_type=OrderType.GTC,
+            )
             return {"ok":True,"cur_price":cur_price,"sell_price":sell_price,"size_sold":sell_size,"resp":resp}
         except Exception as e:
             last_err=str(e)
@@ -568,7 +578,7 @@ def force_sell(s, token_id, size, mode="normal"):
                 if m: sell_size=round(int(m.group(1))/1e6,4)
                 if attempt<3: continue
                 return {"ok":False,"err":"Недостатньо токенів: %s"%last_err}
-            if "500" in last_err or "execution" in last_err.lower():
+            if "version_mismatch" in last_err.lower() or "500" in last_err or "execution" in last_err.lower():
                 s.reset_client()
                 if attempt<3: time.sleep(2); sell_price=max(0.01,sell_price-0.03); continue
             if any(x in last_err.lower() for x in ["unauthorized","401","forbidden"]): s.reset_client(); break
@@ -1107,14 +1117,15 @@ def kb(s):
          InlineKeyboardButton("Аналіз",     callback_data="analyze")],
         [InlineKeyboardButton("Маркет",     callback_data="market"),
          InlineKeyboardButton("Помилки",    callback_data="errors")],
-        [InlineKeyboardButton("Дані ринку", callback_data="rawdata")],
+        [InlineKeyboardButton("Дані ринку", callback_data="rawdata"),
+         InlineKeyboardButton("🤖 AI Агент", callback_data="agent_start")],
         [InlineKeyboardButton(asia,         callback_data="asia_info")],
     ])
 
 WELCOME=(
     "BTC Polymarket Bot v3\n\n"
     "Сигнали кожні 15 хв — :00 :15 :30 :45 UTC\n"
-    "Ставка — 13% від балансу (мін $1)\n"
+    "Ставка — 10% від балансу (мін $1)\n"
     "Авто-Азія — вмикається автоматично (00:00–06:00 Київ)\n\n"
     "Як підключити:\n"
     "1. «Підключити гаманець»\n"
@@ -1154,7 +1165,7 @@ async def cmd_autoon(u,c):
     if not s.ok: await u.message.reply_text("Спочатку підключи гаманець."); return
     s.auto=True; bal,_=get_balance(s); bet=s.bet_size(bal)
     await u.message.reply_text(
-        "Авто-торгівля увімкнена\nБаланс: %s\nСтавка: $%.2f (13%%)"%(
+        "Авто-торгівля увімкнена\nБаланс: %s\nСтавка: $%.2f (10%%)"%(
             ("$%.2f"%bal) if bal else "перевіряємо...",bet),reply_markup=kb(s))
 
 async def cmd_autooff(u,c):
@@ -1179,7 +1190,7 @@ async def on_callback(u,c):
         if s.auto:
             s._asia_auto=False; bal,_=get_balance(s); bet=s.bet_size(bal)
             await q.message.reply_text(
-                "Авто увімкнено\nБаланс: $%.2f\nСтавка: $%.2f (13%%)"%(bal or 0,bet),
+                "Авто увімкнено\nБаланс: $%.2f\nСтавка: $%.2f (10%%)"%(bal or 0,bet),
                 reply_markup=kb(s))
         else:
             s._asia_auto=False
@@ -1196,7 +1207,7 @@ async def on_callback(u,c):
         bal,err=get_balance(s)
         open_val=round(sum(b.get("amount",0) for b in s.open_bets),2)
         if bal is not None and bal>0:
-            msg="Баланс: $%.2f USDC\nСтавка: $%.2f (13%%)"%(bal,s.bet_size(bal))
+            msg="Баланс: $%.2f USDC\nСтавка: $%.2f (10%%)"%(bal,s.bet_size(bal))
             if open_val>0: msg+="\nВ позиціях: $%.2f"%open_val
             await q.message.reply_text(msg)
         else:
@@ -1332,6 +1343,31 @@ async def on_callback(u,c):
         except Exception as e:
             await q.message.reply_text("Помилка збору даних: %s" % str(e)[:200])
 
+    elif q.data=="agent_start":
+        uid = u.effective_user.id
+        _agent_sessions[uid] = {"active": True, "history": []}
+        await q.message.reply_text(
+            "AI Агент увімкнено\n\n"
+            "Пиши будь-який запит — я маю доступ до ринку і можу торгувати.\n\n"
+            "Приклади:\n"
+            "- Проаналізуй ринок зараз\n"
+            "- Постав UP $5 якщо є сетап\n"
+            "- Знайди аномалії\n"
+            "- Покажи баланс і статистику\n\n"
+            "Зупинити: /stopage",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Зупинити агент", callback_data="agent_stop")
+            ]]))
+
+    elif q.data=="agent_stop":
+        uid = u.effective_user.id
+        if uid in _agent_sessions:
+            _agent_sessions[uid]["active"] = False
+            _agent_sessions[uid]["history"] = []
+        await q.message.reply_text(
+            "AI Агент зупинено.\nБот повертається до звичайного режиму.",
+            reply_markup=kb(s))
+
     elif q.data=="skip":
         s.pending={}; await q.edit_message_text("Скасовано.")
 
@@ -1377,7 +1413,7 @@ async def on_message(u,c):
         bal,err=get_balance(s); bet=s.bet_size(bal)
         bal_str=("$%.2f USDC"%bal) if (bal is not None and bal>0) else ("$0 (%s)"%err)
         await u.message.reply_text(
-            "Гаманець підключено\n\nПідписувач: %s\nFunder: %s\n\nБаланс: %s\nСтавка: $%.2f (13%%)\n\nНатисни «Авто: УВІМК»"%(
+            "Гаманець підключено\n\nПідписувач: %s\nFunder: %s\n\nБаланс: %s\nСтавка: $%.2f (10%%)\n\nНатисни «Авто: УВІМК»"%(
                 s.address,addr,bal_str,bet),reply_markup=kb(s)); return
 
     if s.pending and time.time()-s.pending.get("ts",0)<=600:
@@ -1465,7 +1501,7 @@ async def auto_trade(app, s, p, result):
         invert_note = "\nАI: %s → ІНВЕРТ: %s\nПричина: %s" % (dec, final_dec, invert_reason) if inverted else ""
         await app.bot.send_message(chat_id=s.uid,text=(
             "Ставка виконана  %s %s\n\n%s\n\n"
-            "Баланс: $%.2f  Ставка: $%.2f (13%%)\nПотенційно: +$%.2f\n\n%s%s"
+            "Баланс: $%.2f  Ставка: $%.2f (10%%)\nПотенційно: +$%.2f\n\n%s%s"
         )%("▲" if final_dec=="UP" else "▼", final_dec, bet.get("mkt","Polymarket"),
            bal, amount, bet.get("pot",0), logic, invert_note))
     else:
@@ -1590,9 +1626,226 @@ async def cycle(app, s):
         ikb=InlineKeyboardMarkup([[
             InlineKeyboardButton("Так",callback_data="confirm_%s"%final_dec),
             InlineKeyboardButton("Ні", callback_data="skip")]])
-        hint=(" (рекомендовано $%.2f = 13%%)"%bet) if bal else ""
+        hint=(" (рекомендовано $%.2f = 10%%)"%bet) if bal else ""
         await app.bot.send_message(chat_id=s.uid,
             text=main_txt+"\n\nВведи суму USDC"+hint+":",reply_markup=ikb)
+
+# ─────────────────────────────────────────────
+# AI АГЕНТ
+# Окремий режим: юзер пише довільні запити,
+# агент має доступ до всіх даних ринку і може
+# виконувати торгові дії. /agent — старт, /stopage — стоп.
+# ─────────────────────────────────────────────
+_agent_sessions = {}   # uid → {"active": bool, "history": [...]}
+
+AGENT_SYS = """You are an autonomous BTC trading agent on Polymarket with full access to real market data and trading functions.
+
+You have these tools available (call them by writing TOOL: name(args) on a separate line):
+- TOOL: get_market_data() — get current BTC price, structure, sweeps, AMD, order flow, liquidations
+- TOOL: get_balance() — get current USDC balance
+- TOOL: place_bet(direction, amount) — place a trade (direction: UP or DOWN, amount in USDC)
+- TOOL: get_stats() — get signal statistics and winrate
+- TOOL: find_market() — find current active Polymarket market
+
+Rules:
+1. Always get market data BEFORE placing any trade
+2. Apply the same SMC/order flow logic as the main bot signal system
+3. When asked to trade conditionally (e.g. "trade if first 3 signals positive") — track conditions and act accordingly
+4. Explain your reasoning in Ukrainian before every action
+5. After placing a trade, confirm details
+6. If market conditions are unfavorable, say so and don't trade
+7. You can analyze multiple markets, track trends, wait for setups
+
+Always respond in Ukrainian. Be concise but informative."""
+
+async def agent_run_tools(uid, s, app, tool_calls):
+    """Виконує tool calls від агента і повертає результати."""
+    results = []
+    for tool in tool_calls:
+        tool = tool.strip()
+        if not tool.startswith("TOOL:"): continue
+        tool_body = tool[5:].strip()
+
+        if tool_body.startswith("get_market_data"):
+            try:
+                p = build_payload(s)
+                if not p:
+                    results.append("get_market_data: Помилка отримання даних Binance")
+                    continue
+                pr = p["price"]; st = p["struct"]; ctx = p["ctx"]
+                pos = p["pos"]; ad = p["amd"]; liq = p["liq"]
+                sw5 = liq.get("sw5",{}); bc5 = liq.get("bos5")
+                result = (
+                    "get_market_data результат:\n"
+                    "Ціна: $%.2f | Сесія: %s | Режим: %s\n"
+                    "Структура: 15m=%s 5m=%s 1m=%s\n"
+                    "Sweep5m: %s@%.2f ago=%d\n"
+                    "BOS5m: %s\n"
+                    "AMD: %s→%s conf=%d [%s]\n"
+                    "OB: %s(%.1f%%) | L/S: %.3f(%s)\n"
+                    "Ліквідації: Long=$%.0f Short=$%.0f Sig=%s\n"
+                    "Funding: %+.6f(%s) | OI_chg: %+.4f%%\n"
+                    "Vol: %s | Mic1m: %+.4f%% | Mom5m: %+.4f%%"
+                ) % (
+                    pr["cur"], ctx["sess"], ctx["reg"],
+                    st["15m"], st["5m"], st["1m"],
+                    sw5.get("type","N"), sw5.get("level",0), sw5.get("ago",0),
+                    ("%s %s@%.2f"%(bc5["type"],bc5["dir"],bc5["level"])) if bc5 else "none",
+                    ad.get("phase","NONE"), ad.get("dir","?"), ad.get("conf",0), ad.get("reason",""),
+                    pos["ob"], pos["obi"], pos["lsrr"], pos["lsr"],
+                    pos["ll"], pos["ls"], pos["lsig"],
+                    pos["fr"], pos["fs"], pos["oic"],
+                    ctx["vol"], pr["mic"], pr["mom5"]
+                )
+                results.append(result)
+            except Exception as e:
+                results.append("get_market_data: помилка %s" % str(e)[:100])
+
+        elif tool_body.startswith("get_balance"):
+            bal, err = get_balance(s)
+            if bal is not None:
+                results.append("get_balance: $%.2f USDC | ставка 10%%: $%.2f" % (bal, s.bet_size(bal)))
+            else:
+                results.append("get_balance: помилка — %s" % err)
+
+        elif tool_body.startswith("place_bet"):
+            import re as _re
+            m = _re.search(r'place_bet\s*\(\s*["\']?(UP|DOWN)["\']?\s*,\s*([\d.]+)\s*\)', tool_body)
+            if not m:
+                results.append("place_bet: неправильний формат. Використовуй: place_bet(UP, 5.0)")
+                continue
+            direction = m.group(1); amount = float(m.group(2))
+            if not s.ok:
+                results.append("place_bet: гаманець не підключено")
+                continue
+            bet = place_bet(s, direction, amount)
+            if bet["ok"]:
+                bet_id = "%d_%d_agent" % (uid, int(time.time()))
+                open_bet = {
+                    "bet_id": bet_id, "token_id": bet["token_id"], "direction": direction,
+                    "amount": amount, "size": bet["size"], "entry_price": bet["price"],
+                    "placed_at": time.time(), "market_end": bet.get("market_end", time.time()+900),
+                    "bal_before": 0, "mkt": bet.get("mkt",""), "strength": "AGENT",
+                    "logic": "AI Agent trade", "score": 0, "key_signal": "agent",
+                    "amd_phase": "", "session": "",
+                }
+                s.open_bets.append(open_bet)
+                poly_stats_update(bet_id, {"status":"OPEN","source":"agent",
+                    "opened_at": datetime.datetime.now(datetime.timezone.utc).isoformat()})
+                bal_now, _ = get_balance(s)
+                poly_wr_add(uid=uid, bet_id=bet_id, direction=direction,
+                            amount=amount, bal_before=bal_now or 0,
+                            strength="AGENT", session_name="AGENT")
+                results.append("place_bet: виконано! %s $%.2f | pot=+$%.2f | %s" % (
+                    direction, amount, bet.get("pot",0), bet.get("mkt","")[:40]))
+            else:
+                results.append("place_bet: помилка — %s" % bet["err"][:150])
+
+        elif tool_body.startswith("get_stats"):
+            check_outcomes(s)
+            results.append("get_stats:\n" + stats_msg(s))
+
+        elif tool_body.startswith("find_market"):
+            m = find_market()
+            if m:
+                results.append("find_market: %s | YES=%.4f NO=%.4f | закривається %.0f сек" % (
+                    m["q"][:60], m["yes_p"], m["no_p"], m["diff"]))
+            else:
+                results.append("find_market: маркет не знайдено")
+
+        else:
+            results.append("Невідомий інструмент: %s" % tool_body[:50])
+
+    return results
+
+async def agent_process(uid, s, app, user_msg):
+    """Обробляє одне повідомлення агента."""
+    if uid not in _agent_sessions:
+        _agent_sessions[uid] = {"active": True, "history": []}
+    agent = _agent_sessions[uid]
+
+    # Додаємо повідомлення юзера
+    agent["history"].append({"role": "user", "content": user_msg})
+
+    # Обмеження history до 20 повідомлень
+    if len(agent["history"]) > 20:
+        agent["history"] = agent["history"][-20:]
+
+    try:
+        client = anthropic.Anthropic(api_key=OPENAI_API_KEY)
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=2048,
+            system=AGENT_SYS,
+            messages=agent["history"]
+        )
+        ai_text = resp.content[0].text.strip()
+        agent["history"].append({"role": "assistant", "content": ai_text})
+
+        # Виконуємо tool calls якщо є
+        lines = ai_text.split("\n")
+        tool_lines = [l for l in lines if l.strip().startswith("TOOL:")]
+        tool_results = []
+        if tool_lines:
+            tool_results = await agent_run_tools(uid, s, app, tool_lines)
+
+        # Відправляємо відповідь агента
+        # Ріжемо якщо довго
+        for i in range(0, len(ai_text), 4000):
+            await app.bot.send_message(chat_id=uid, text=ai_text[i:i+4000])
+
+        # Відправляємо результати tools
+        if tool_results:
+            tools_txt = "Результати виконання:\n\n" + "\n\n".join(tool_results)
+            for i in range(0, len(tools_txt), 4000):
+                await app.bot.send_message(chat_id=uid, text=tools_txt[i:i+4000])
+
+            # Якщо були tool results — даємо агенту відповісти ще раз
+            agent["history"].append({"role": "user", "content": "Tool results:\n" + "\n".join(tool_results)})
+            resp2 = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=1024,
+                system=AGENT_SYS,
+                messages=agent["history"]
+            )
+            ai_text2 = resp2.content[0].text.strip()
+            agent["history"].append({"role": "assistant", "content": ai_text2})
+            if ai_text2:
+                for i in range(0, len(ai_text2), 4000):
+                    await app.bot.send_message(chat_id=uid, text=ai_text2[i:i+4000])
+
+    except Exception as e:
+        await app.bot.send_message(chat_id=uid,
+            text="Помилка агента: %s" % str(e)[:200])
+
+async def cmd_agent(u, c):
+    """Команда /agent — вмикає AI агента."""
+    s = sess(u.effective_user.id); uid = u.effective_user.id
+    _agent_sessions[uid] = {"active": True, "history": []}
+    await u.message.reply_text(
+        "AI Агент увімкнено\n\n"
+        "Тепер пиши мені будь-що — я маю доступ до всіх даних ринку і можу торгувати.\n\n"
+        "Приклади:\n"
+        "- Проаналізуй ринок зараз\n"
+        "- Постав UP на $5 якщо є хороший сетап\n"
+        "- Торгуй в Азію наступні 3 сигнали\n"
+        "- Знайди аномалії на ринку\n"
+        "- Покажи баланс і статистику\n\n"
+        "Зупинити: /stopage або кнопка Зупинити агент\n\n"
+        "Писати можна зараз:",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("Зупинити агент", callback_data="agent_stop")
+        ]]))
+
+async def cmd_stopage(u, c):
+    """Команда /stopage — зупиняє AI агента."""
+    uid = u.effective_user.id
+    if uid in _agent_sessions:
+        _agent_sessions[uid]["active"] = False
+        _agent_sessions[uid]["history"] = []
+    await u.message.reply_text(
+        "AI Агент зупинено.\nБот повертається до звичайного режиму.",
+        reply_markup=kb(sess(uid)))
 
 # ─────────────────────────────────────────────
 # ПЛАНУВАЛЬНИК
@@ -1642,7 +1895,8 @@ async def scheduler(app):
 def main():
     app=Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     for cmd,fn in [("start",cmd_start),("stats",cmd_stats),
-                   ("analyze",cmd_analyze),("autoon",cmd_autoon),("autooff",cmd_autooff)]:
+                   ("analyze",cmd_analyze),("autoon",cmd_autoon),("autooff",cmd_autooff),
+                   ("agent",cmd_agent),("stopage",cmd_stopage)]:
         app.add_handler(CommandHandler(cmd,fn))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,on_message))
