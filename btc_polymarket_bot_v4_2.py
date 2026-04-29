@@ -1045,7 +1045,7 @@ def analyze_with_ai(p, s):
         )
 
         resp = client.messages.create(
-            model="claude-opus-4-5-20251001",
+            model="claude-haiku-4-5-20251001",
             max_tokens=1024,
             system=SYS,
             messages=[{"role":"user","content":msg}])
