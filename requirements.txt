@@ -2,6 +2,6 @@ python-telegram-bot==20.7
 openai>=1.0.0
 requests>=2.31.0
 eth-account>=0.10.0
-py-clob-client_v2>=0.14.0
+py-clob-client_v2
 web3>=6.0.0
 anthropic>=0.40.0
