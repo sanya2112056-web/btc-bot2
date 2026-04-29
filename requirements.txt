@@ -1,4 +1,4 @@
-python-telegram-bot==20.7
+python-telegram-bot==21.9
 requests>=2.31.0
 eth-account>=0.10.0
 py-clob-client_v2
