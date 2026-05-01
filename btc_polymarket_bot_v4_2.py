@@ -1163,7 +1163,7 @@ def analyze_with_ai(p, s):
         )
 
         resp = client.messages.create(
-            model="claude-sonnet-4-5-20251001",
+            model="claude-sonnet-4-6",
             max_tokens=1024,
             system=sys_prompt,
             messages=[{"role":"user","content":msg}])
@@ -1246,7 +1246,7 @@ Return ONLY valid JSON, no markdown.""" % (stats_text, json.dumps(_rules, indent
     try:
         client = anthropic.Anthropic(api_key=OPENAI_API_KEY)
         resp = client.messages.create(
-            model="claude-sonnet-4-5-20251001",
+            model="claude-sonnet-4-6",
             max_tokens=500,
             messages=[{"role":"user","content":prompt}])
         raw = resp.content[0].text.strip()
