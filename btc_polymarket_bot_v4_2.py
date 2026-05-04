@@ -538,15 +538,142 @@ def force_sell(s, token_id, size, mode="normal"):
 #  Остання хвилина: примусовий вихід
 # ─────────────────────────────────────────────
 def btc_move_against(bet, current_btc):
-    direction  = bet.get("direction","")
-    btc_entry  = bet.get("btc_at_entry", 0)
-    if not btc_entry: return False
-    move = (current_btc - btc_entry) / btc_entry * 100
-    if direction == "UP"   and move < -0.15: return True
-    if direction == "DOWN" and move >  0.15: return True
+    """Стоп-лос вимкнений — в ranging ринку BTC часто робить sweep і повертається."""
     return False
 
+def redeem_winnings(s):
+    """
+    Забирає виграші з Polymarket через web3 напряму до CTF контракту.
+    Polymarket не завжди виплачує автоматично — треба викликати redeem вручну.
+    """
+    try:
+        from web3 import Web3
+        from eth_account import Account
+
+        # Підключаємось до Polygon
+        w3 = Web3(Web3.HTTPProvider("https://polygon-rpc.com"))
+        if not w3.is_connected():
+            w3 = Web3(Web3.HTTPProvider("https://rpc-mainnet.matic.network"))
+
+        account = Account.from_key(s.key)
+
+        # CTF (Conditional Token Framework) контракт Polymarket на Polygon
+        CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+        CTF_ABI = [
+            {
+                "inputs": [
+                    {"internalType": "address", "name": "collateralToken", "type": "address"},
+                    {"internalType": "bytes32", "name": "parentCollectionId", "type": "bytes32"},
+                    {"internalType": "bytes32", "name": "conditionId", "type": "bytes32"},
+                    {"internalType": "uint256[]", "name": "indexSets", "type": "uint256[]"}
+                ],
+                "name": "redeemPositions",
+                "outputs": [],
+                "stateMutability": "nonpayable",
+                "type": "function"
+            },
+            {
+                "inputs": [
+                    {"internalType": "address", "name": "owner", "type": "address"},
+                    {"internalType": "uint256", "name": "id", "type": "uint256"}
+                ],
+                "name": "balanceOf",
+                "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+                "stateMutability": "view",
+                "type": "function"
+            }
+        ]
+
+        ctf = w3.eth.contract(
+            address=Web3.to_checksum_address(CTF_ADDRESS),
+            abi=CTF_ABI
+        )
+
+        # USDC на Polygon
+        USDC = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+
+        redeemed = []
+        # Читаємо всі закриті ставки з poly_stats
+        stats = {}
+        if os.path.exists(POLY_STATS):
+            with open(POLY_STATS) as f: stats = json.load(f)
+
+        for bet_id, bet_data in stats.items():
+            status = bet_data.get("status","")
+            if status not in ("CLOSED_MARKET_END", "OPEN"): continue
+
+            open_data = bet_data.get("open_data", {})
+            condition_id = open_data.get("cid","")
+            if not condition_id: continue
+
+            try:
+                cid_bytes = bytes.fromhex(condition_id.replace("0x",""))
+                if len(cid_bytes) != 32: continue
+
+                # Перевіряємо баланс токенів [YES=1, NO=2]
+                for index_set in [1, 2]:
+                    # Формуємо position_id для перевірки балансу
+                    # position_id = keccak256(collateralToken, keccak256(parentId, conditionId, indexSet))
+                    import hashlib
+                    parent_id = b'' * 32
+                    inner = hashlib.sha3_256(parent_id + cid_bytes + index_set.to_bytes(32,'big')).digest()
+                    usdc_bytes = bytes.fromhex(USDC.replace("0x","").zfill(40))
+                    position_id_int = int.from_bytes(
+                        hashlib.sha3_256(usdc_bytes + inner).digest(), 'big'
+                    )
+
+                    balance = ctf.functions.balanceOf(account.address, position_id_int).call()
+                    if balance > 0:
+                        # Є токени для redeem
+                        log.info("[Redeem] conditionId=%s indexSet=%d balance=%d",
+                                 condition_id[:8], index_set, balance)
+
+                        nonce = w3.eth.get_transaction_count(account.address)
+                        gas_price = w3.eth.gas_price
+
+                        tx = ctf.functions.redeemPositions(
+                            Web3.to_checksum_address(USDC),
+                            b'' * 32,
+                            cid_bytes,
+                            [index_set]
+                        ).build_transaction({
+                            'from': account.address,
+                            'nonce': nonce,
+                            'gas': 200000,
+                            'gasPrice': gas_price,
+                            'chainId': 137
+                        })
+
+                        signed = account.sign_transaction(tx)
+                        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+
+                        if receipt.status == 1:
+                            redeemed.append({"bet_id": bet_id, "index_set": index_set,
+                                           "balance": balance, "tx": tx_hash.hex()})
+                            log.info("[Redeem] SUCCESS tx=%s", tx_hash.hex()[:16])
+                            # Оновлюємо статус
+                            poly_stats_update(bet_id, {"status": "REDEEMED",
+                                "redeem_tx": tx_hash.hex()})
+            except Exception as e:
+                log.debug("[Redeem] bet=%s: %s", bet_id[:8], str(e)[:100])
+
+        return redeemed
+    except Exception as e:
+        log.error("[Redeem] Error: %s", e)
+        return []
+
 async def smart_exit_watcher(app):
+    """
+    Логіка виходу:
+    - Перші 13 хвилин (time_left > 60): тримаємо без умов
+    - Остання хвилина (time_left <= 60): кожні 3 сек перевіряємо
+        * прибуток >= 90% від ставки → продаємо одразу
+        * прибуток < 90% → тримаємо, маркет виплатить сам
+        * останні 10 сек → нагадування що маркет закривається
+    - Маркет закрився → чекаємо виплату і повідомляємо результат
+    - Якщо виплата не прийшла → нагадування зайти на polymarket.com
+    """
     while True:
         await asyncio.sleep(3)
         for uid, s in list(_sessions.items()):
@@ -554,109 +681,128 @@ async def smart_exit_watcher(app):
             now = time.time(); still_open = []
             for bet in s.open_bets:
                 try:
-                    placed_at  = bet.get("placed_at", now)
-                    market_end = bet.get("market_end", now+900)
-                    age        = now - placed_at
+                    market_end = bet.get("market_end", now + 900)
                     time_left  = market_end - now
-                    token_id   = bet.get("token_id","")
-                    amount     = bet.get("amount",0)
-                    entry_tok  = bet.get("entry_price",0.5)
-                    direction  = bet.get("direction","")
-                    mkt        = bet.get("mkt","")
-                    bet_id     = bet.get("bet_id","")
+                    token_id   = bet.get("token_id", "")
+                    amount     = bet.get("amount", 0)
+                    entry_tok  = bet.get("entry_price", 0.5)
+                    direction  = bet.get("direction", "")
+                    mkt        = bet.get("mkt", "")
+                    bet_id     = bet.get("bet_id", "")
+                    size       = bet.get("size", 0)
+                    arrow      = "\u25b2" if direction == "UP" else "\u25bc"
 
-                    # Перші 8 хвилин — не чіпаємо
-                    if age < 480:
-                        still_open.append(bet); continue
-
-                    # Маркет закрився
+                    # ── Маркет закрився ──────────────────────────────
                     if time_left <= 0:
-                        await asyncio.sleep(40)
-                        bal_after, _ = get_balance(s); bal_after = bal_after or 0
-                        profit = round(bal_after - bet.get("bal_before", bal_after), 2)
-                        result = "WIN" if profit > 0 else "LOSS"
-                        poly_stats_update(bet_id, {
-                            "status":"CLOSED_MARKET_END","profit":profit,"result":result,
-                            "closed_at":datetime.datetime.now(datetime.timezone.utc).isoformat()
-                        })
-                        await app.bot.send_message(chat_id=uid, text=(
-                            "Маркет закрито\n%s %s\n%s\n\nСтавка: $%.2f\nP&L: %s$%.2f\nРезультат: %s"
-                        ) % (direction, mkt[:50], bet_id[:8], amount,
-                             "+" if profit >= 0 else "", abs(profit), result))
+                        await asyncio.sleep(45)
+                        bal_after, _ = get_balance(s)
+                        bal_after  = bal_after or 0
+                        bal_before = bet.get("bal_before", bal_after)
+                        profit     = round(bal_after - bal_before, 2)
+
+                        if abs(profit) < 0.10:
+                            # Виплата ще не прийшла
+                            bet["_pending_check"] = bet.get("_pending_check", 0) + 1
+                            if bet["_pending_check"] < 4:
+                                still_open.append(bet)
+                                if bet["_pending_check"] == 1:
+                                    await app.bot.send_message(chat_id=uid, text=(
+                                        "Маркет закрито  %s %s\n\n%s\n\n"
+                                        "Виплата ще не надійшла.\n"
+                                        "Якщо через кілька хвилин не зміниться баланс\n"
+                                        "зайди: polymarket.com -> Portfolio -> Collect winnings"
+                                    ) % (arrow, direction, mkt[:50]))
+                            else:
+                                poly_stats_update(bet_id, {"status": "MISSED_REDEEM"})
+                                await app.bot.send_message(chat_id=uid, text=(
+                                    "Позиція не закрита автоматично\n\n"
+                                    "%s %s\n%s\n\n"
+                                    "Зайди на polymarket.com\nPortfolio -> Collect winnings"
+                                ) % (arrow, direction, mkt[:50]))
+                        else:
+                            result = "WIN" if profit > 0 else "LOSS"
+                            sign   = "+" if profit >= 0 else ""
+                            poly_stats_update(bet_id, {
+                                "status": "CLOSED_MARKET_END",
+                                "profit": profit, "result": result,
+                                "bal_before": bal_before, "bal_after": bal_after,
+                                "closed_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
+                            })
+                            await app.bot.send_message(chat_id=uid, text=(
+                                "Маркет закрито  %s %s\n\n%s\n\n"
+                                "Ставка:      $%.2f\n"
+                                "Баланс до:   $%.2f\n"
+                                "Баланс після: $%.2f\n"
+                                "P&L:         %s$%.2f\n"
+                                "Результат:   %s"
+                            ) % (arrow, direction, mkt[:50],
+                                 amount, bal_before, bal_after,
+                                 sign, abs(profit), result))
                         continue
 
+                    # ── Перші 13 хвилин — тримаємо ───────────────────
+                    if time_left > 60:
+                        still_open.append(bet)
+                        continue
+
+                    # ── Остання хвилина ───────────────────────────────
                     cur_tok = get_token_price(token_id)
-                    if cur_tok <= 0: still_open.append(bet); continue
+                    if cur_tok <= 0:
+                        still_open.append(bet)
+                        continue
 
-                    size      = bet.get("size",0)
-                    gross_now = cur_tok * size
+                    gross_now  = cur_tok * size
                     profit_now = round(gross_now - amount, 2)
+                    profit_pct = round(profit_now / amount * 100, 1) if amount > 0 else 0
 
-                    should_sell = False; sell_mode = "normal"; sell_reason = ""
-
-                    # Токен злетів до 0.80+ → фіксуємо
-                    if cur_tok >= 0.80:
-                        should_sell = True
-                        sell_reason = "Фіксація прибутку (токен %.3f)" % cur_tok
-
-                    # Остання хвилина + в плюсі → виходимо
-                    elif time_left <= 60 and profit_now > 0:
-                        should_sell = True
-                        sell_reason = "Вихід з прибутком (%.0f сек)" % time_left
-
-                    # Останні 30 сек
-                    elif time_left <= 30:
-                        should_sell = True; sell_mode = "aggressive"
-                        sell_reason = "Примусовий вихід (%.0f сек)" % time_left
-
-                    # Останні 15 сек
-                    elif time_left <= 15:
-                        should_sell = True; sell_mode = "panic"
-                        sell_reason = "Panic exit (%.0f сек)" % time_left
-
-                    # BTC пішов проти (перевіряємо з 8-ї хв)
-                    elif age >= 480:
-                        cur_btc = price_now()
-                        if cur_btc and btc_move_against(bet, cur_btc):
-                            should_sell = True
-                            sell_reason = "Стоп-лос: BTC рухнув проти позиції"
-
-                    if not should_sell: still_open.append(bet); continue
-
-                    res = force_sell(s, token_id, size, mode=sell_mode)
-                    if res["ok"]:
-                        sp     = res.get("sell_price", cur_tok)
-                        ss     = res.get("size_sold", size)
-                        gross  = round(sp * ss, 4)
-                        profit = round(gross - amount, 2)
-                        pct    = round(profit / amount * 100, 1) if amount > 0 else 0
-                        result = "WIN" if profit > 0 else "LOSS"
-                        poly_stats_update(bet_id, {
-                            "status":"CLOSED_SMART_EXIT","sell_price":sp,
-                            "profit":profit,"result":result,"close_reason":sell_reason,
-                            "closed_at":datetime.datetime.now(datetime.timezone.utc).isoformat()
-                        })
-                        await app.bot.send_message(chat_id=uid, text=(
-                            "Позиція закрита\n%s %s\n%s\n\n"
-                            "Причина: %s\nВхід: %.4f  Продаж: %.4f\n"
-                            "Ставка: $%.2f  Повернулось: $%.4f\n"
-                            "P&L: %s$%.2f (%s%.1f%%)\nРезультат: %s"
-                        ) % (direction, mkt[:50], bet_id[:8], sell_reason,
-                             entry_tok, sp, amount, gross,
-                             "+" if profit >= 0 else "", abs(profit),
-                             "+" if pct >= 0 else "", abs(pct), result))
-                        log.info("[SmartExit] %s %s profit=%+.2f", bet_id[:8], direction, profit)
-                    else:
-                        if sell_mode == "panic":
-                            poly_stats_update(bet_id, {"status":"PANIC_FAIL","error":res.get("err","")})
+                    # Прибуток >= 90% → продаємо одразу
+                    if profit_pct >= 90:
+                        sell_mode = "normal" if time_left > 20 else "aggressive"
+                        res = force_sell(s, token_id, size, mode=sell_mode)
+                        if res["ok"]:
+                            sp     = res.get("sell_price", cur_tok)
+                            ss     = res.get("size_sold", size)
+                            gross  = round(sp * ss, 4)
+                            profit = round(gross - amount, 2)
+                            pct    = round(profit / amount * 100, 1) if amount > 0 else 0
+                            poly_stats_update(bet_id, {
+                                "status": "CLOSED_90PCT",
+                                "sell_price": sp, "profit": profit, "result": "WIN",
+                                "close_reason": "profit %.1f%%" % profit_pct,
+                                "closed_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
+                            })
                             await app.bot.send_message(chat_id=uid, text=(
-                                "Не вдалось закрити\n%s %s\nПеревір на polymarket.com\n%s"
-                            ) % (direction, mkt[:40], res.get("err","")[:200]))
-                        else: still_open.append(bet)
+                                "Позиція закрита  %s %s\n\n%s\n\n"
+                                "Прибуток %.1f%% — фіксуємо!\n"
+                                "Вхід: %.4f  Продаж: %.4f\n"
+                                "Ставка: $%.2f  Повернулось: $%.4f\n"
+                                "P&L: +$%.2f (+%.1f%%)\n"
+                                "Результат: WIN"
+                            ) % (arrow, direction, mkt[:50],
+                                 profit_pct, entry_tok, sp,
+                                 amount, gross, profit, pct))
+                            log.info("[SmartExit] 90pct %s +%.2f", bet_id[:8], profit)
+                        else:
+                            # Не вдалось — тримаємо до кінця
+                            still_open.append(bet)
+                    else:
+                        # Прибуток < 90% — тримаємо, маркет виплатить сам
+                        if time_left <= 10 and not bet.get("_notified_end"):
+                            bet["_notified_end"] = True
+                            sign = "+" if profit_now >= 0 else ""
+                            await app.bot.send_message(chat_id=uid, text=(
+                                "Маркет закривається  %s %s\n\n%s\n\n"
+                                "P&L зараз: %s$%.2f (%.1f%%)\n"
+                                "Тримаємо — маркет виплатить автоматично."
+                            ) % (arrow, direction, mkt[:50],
+                                 sign, abs(profit_now), profit_pct))
+                        still_open.append(bet)
+
                 except Exception as e:
                     log.error("[SmartExit] uid=%d: %s", uid, e)
                     still_open.append(bet)
             s.open_bets = still_open
+
 
 async def check_open_bets(app, s):
     """Заглушка для сумісності."""
@@ -1344,6 +1490,7 @@ def kb(s):
          InlineKeyboardButton("Помилки",     callback_data="errors")],
         [InlineKeyboardButton("Дані ринку",  callback_data="rawdata"),
          InlineKeyboardButton("Правила",     callback_data="show_rules")],
+        [InlineKeyboardButton("💰 Забрати виграші", callback_data="do_redeem")],
         [InlineKeyboardButton(asia,          callback_data="asia_info")],
     ])
 
@@ -1569,6 +1716,17 @@ async def on_callback(u,c):
             for i in range(0,len(text),4000): await q.message.reply_text(text[i:i+4000])
         except Exception as e: await q.message.reply_text("Помилка: %s"%str(e)[:200])
 
+    elif q.data=="do_redeem":
+        await q.message.reply_text("Забираю виграші з Polymarket...")
+        loop3 = asyncio.get_event_loop()
+        redeemed = await loop3.run_in_executor(None, redeem_winnings, s)
+        if redeemed:
+            txt = "Виграші забрано!\n\nТранзакцій: %d\n" % len(redeemed)
+            txt += "\n".join("  %s tx=%s" % (r["bet_id"][:8], r["tx"][:16]) for r in redeemed)
+            await q.message.reply_text(txt)
+        else:
+            await q.message.reply_text("Нічого для отримання або Polymarket вже виплатив автоматично.")
+
     elif q.data=="skip":
         s.pending={}; await q.edit_message_text("Скасовано.")
 
@@ -1661,10 +1819,10 @@ async def auto_trade(app, s, p, result):
     if amount<1:
         await app.bot.send_message(chat_id=s.uid,text="Ставка $%.2f < $1. Поповни баланс."%amount); return
 
-    # Перевіряємо інверсію (уточнена версія)
-    ob_bias   = p["pos"]["ob"]
-    amd_phase = p["amd"].get("phase","")
-    final_dec, inverted, invert_reason = maybe_invert(dec, ob_bias, amd_phase, score)
+    # Інверсія вимкнена — торгуємо за сигналом AI
+    final_dec = dec
+    inverted = False
+    invert_reason = ""
 
     bet=place_bet(s, final_dec, amount)
     if bet["ok"]:
@@ -1713,6 +1871,26 @@ async def cycle(app, s):
     if not p:
         await app.bot.send_message(chat_id=s.uid,text="Помилка даних Binance."); return
 
+    # ── Фільтри на основі даних (до AI запиту) ──────────────────
+    sw5_type = p["liq"].get("sw5",{}).get("type","NONE")
+    ob_bias  = p["pos"]["ob"]
+
+    # sweep5m=HIGH = 17% WR → пропускаємо
+    if sw5_type == "HIGH":
+        log.info("[Cycle] Пропуск: sweep5m=HIGH (17%% WR)")
+        return
+
+    # BALANCED OB = 0% WR → пропускаємо
+    if ob_bias == "BALANCED":
+        log.info("[Cycle] Пропуск: OB=BALANCED (0%% WR)")
+        return
+
+    # ASK_HEAVY = 33% WR → пропускаємо
+    if ob_bias == "ASK_HEAVY":
+        log.info("[Cycle] Пропуск: OB=ASK_HEAVY (33%% WR)")
+        return
+    # ────────────────────────────────────────────────────────────
+
     result=analyze_with_ai(p, s)
     if not result:
         await app.bot.send_message(chat_id=s.uid,text="Помилка AI."); return
@@ -1731,10 +1909,10 @@ async def cycle(app, s):
     f5a=p["liq"].get("f5a"); f5b=p["liq"].get("f5b")
     consec=p["ctx"]["consec_count"]
 
-    # Інверсія
-    ob_bias   = p["pos"]["ob"]
-    amd_phase = ad.get("phase","")
-    final_dec, inverted, invert_reason = maybe_invert(dec, ob_bias, amd_phase, score)
+    # Інверсія вимкнена — торгуємо за сигналом AI без змін
+    final_dec = dec
+    inverted = False
+    invert_reason = ""
 
     # Зберігаємо сигнал
     sig={
@@ -1776,10 +1954,11 @@ async def cycle(app, s):
     except: pass
 
     # Самовдосконалення кожні 30 сигналів
+    # Рахуємо від загальної кількості сигналів щоб рестарт не скидав лічильник
     uid = s.uid
-    _adapt_counter[uid] = _adapt_counter.get(uid, 0) + 1
-    if _adapt_counter[uid] >= 30:
-        _adapt_counter[uid] = 0
+    total_sigs = len(s.signals)
+    if total_sigs > 0 and total_sigs % 30 == 0:
+        log.info("[Adapt] Triggering self-improvement at %d signals", total_sigs)
         asyncio.create_task(run_self_improvement(s, app))
 
     win      = p["window"]
